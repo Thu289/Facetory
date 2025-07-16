@@ -36,7 +36,7 @@ export interface MakeupExtractionResult {
 }
 
 export async function extractMakeup(formData: FormData): Promise<MakeupExtractionResult> {
-  const res = await fetch('/api/makeup/extract', {
+  const res = await fetch('/api/face/makeup/extract', {
     method: 'POST',
     body: formData,
   });
