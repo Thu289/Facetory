@@ -14,4 +14,9 @@ pydantic==2.5.0
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
 alembic==1.12.1
-httpx==0.25.2 
+httpx==0.25.2
+torch>=2.0.0
+torchvision
+retina-face
+tf-keras
+mediapipe
