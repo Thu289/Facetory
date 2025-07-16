@@ -28,12 +28,14 @@ export interface MakeupExtractionResult {
   lips_color: [number, number, number]; // [R, G, B]
   left_eye_color: [number, number, number];
   right_eye_color: [number, number, number];
+  left_eyebrow_color: [number, number, number];
+  right_eyebrow_color: [number, number, number];
+  left_cheek_color: [number, number, number];
+  right_cheek_color: [number, number, number];
+  contour_shape: [number, number][]; // Array of [x, y] pixel coordinates
 }
 
-export async function extractMakeup(file: File | Blob): Promise<MakeupExtractionResult> {
-  const formData = new FormData();
-  formData.append('file', file);
-
+export async function extractMakeup(formData: FormData): Promise<MakeupExtractionResult> {
   const res = await fetch('/api/makeup/extract', {
     method: 'POST',
     body: formData,

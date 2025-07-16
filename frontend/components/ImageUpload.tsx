@@ -26,6 +26,22 @@ const ImageUpload: React.FC<ImageUploadProps> = () => {
   const [extractingMakeup, setExtractingMakeup] = useState(false)
   const [makeupError, setMakeupError] = useState<string | null>(null)
 
+  // Attribute options
+  const ATTRIBUTE_OPTIONS = [
+    { key: 'lips_color', label: 'Lips' },
+    { key: 'left_eye_color', label: 'Left Eye' },
+    { key: 'right_eye_color', label: 'Right Eye' },
+    { key: 'left_eyebrow_color', label: 'Left Eyebrow' },
+    { key: 'right_eyebrow_color', label: 'Right Eyebrow' },
+    { key: 'left_cheek_color', label: 'Left Cheek' },
+    { key: 'right_cheek_color', label: 'Right Cheek' },
+    { key: 'contour_shape', label: 'Contour (Jawline)' },
+  ];
+
+  const [selectedAttributes, setSelectedAttributes] = useState<string[]>(ATTRIBUTE_OPTIONS.map(opt => opt.key));
+  const [selectAll, setSelectAll] = useState(true);
+  const [autoCropped, setAutoCropped] = useState(false);
+
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
     const file = acceptedFiles[0]
     if (!file) return
@@ -47,6 +63,10 @@ const ImageUpload: React.FC<ImageUploadProps> = () => {
     setBoundingBoxes([])
     setImageSize(null)
     setUploadedFile(file)
+    setSelectedFace(null)
+    setCroppedImage(null)
+    setMakeupResult(null)
+    setAutoCropped(false)
 
     try {
       // Create preview
@@ -56,11 +76,9 @@ const ImageUpload: React.FC<ImageUploadProps> = () => {
       }
       reader.readAsDataURL(file)
 
-      // Gọi detect face API
+      // Detect faces
       setDetecting(true)
-      console.log('Detecting faces...')
       const detection: FaceDetectionResult = await detectFaces(file)
-      console.log('Detection:', detection)
       setBoundingBoxes(
         detection.faces.map((f) => ({
           box: f.bounding_box,
@@ -68,10 +86,33 @@ const ImageUpload: React.FC<ImageUploadProps> = () => {
         }))
       )
       setImageSize(detection.image_size)
+
+      // If only 1 face, auto-crop
+      if (detection.faces.length === 1) {
+        const [x1, y1, x2, y2] = detection.faces[0].bounding_box
+        const formData = new FormData()
+        formData.append('file', file)
+        formData.append('x1', x1.toString())
+        formData.append('y1', y1.toString())
+        formData.append('x2', x2.toString())
+        formData.append('y2', y2.toString())
+        const res = await fetch('/api/face/crop', {
+          method: 'POST',
+          body: formData,
+        })
+        const data = await res.json()
+        setCroppedImage('data:image/jpeg;base64,' + data.cropped_image_base64)
+        setAutoCropped(true)
+        setSelectedFace(0)
+      }
     } catch (err) {
       setError('Failed to detect face')
       setBoundingBoxes([])
       setImageSize(null)
+      setCroppedImage(null)
+      setAutoCropped(false)
+      setSelectedFace(null)
+      setMakeupResult(null)
       console.error(err)
     } finally {
       setIsUploading(false)
@@ -100,6 +141,27 @@ const ImageUpload: React.FC<ImageUploadProps> = () => {
       x: displaySize.width / imageSize.width,
       y: displaySize.height / imageSize.height,
     }
+  }
+
+  // Attribute selection handlers
+  const handleSelectAll = () => {
+    if (selectAll) {
+      setSelectedAttributes([])
+      setSelectAll(false)
+    } else {
+      setSelectedAttributes(ATTRIBUTE_OPTIONS.map(opt => opt.key))
+      setSelectAll(true)
+    }
+  }
+  const handleAttributeChange = (key: string) => {
+    let updated: string[]
+    if (selectedAttributes.includes(key)) {
+      updated = selectedAttributes.filter(k => k !== key)
+    } else {
+      updated = [...selectedAttributes, key]
+    }
+    setSelectedAttributes(updated)
+    setSelectAll(updated.length === ATTRIBUTE_OPTIONS.length)
   }
 
   return (
@@ -217,9 +279,29 @@ const ImageUpload: React.FC<ImageUploadProps> = () => {
             <div className="mt-4">
               <h4 className="font-semibold">Cropped Face</h4>
               <img src={croppedImage} alt="Cropped face" className="rounded shadow" />
-              <div className="mt-2">
+              <div className="mt-4">
+                <div className="mb-2 flex items-center gap-4 flex-wrap">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={selectAll}
+                      onChange={handleSelectAll}
+                    />
+                    <span className="font-semibold">Select All</span>
+                  </label>
+                  {ATTRIBUTE_OPTIONS.map(opt => (
+                    <label key={opt.key} className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedAttributes.includes(opt.key)}
+                        onChange={() => handleAttributeChange(opt.key)}
+                      />
+                      <span>{opt.label}</span>
+                    </label>
+                  ))}
+                </div>
                 <button
-                  className="px-4 py-2 bg-purple-600 text-white rounded"
+                  className="px-4 py-2 bg-purple-600 text-white rounded disabled:opacity-50"
                   onClick={async () => {
                     setExtractingMakeup(true)
                     setMakeupError(null)
@@ -228,7 +310,11 @@ const ImageUpload: React.FC<ImageUploadProps> = () => {
                       // Convert base64 to Blob
                       const res = await fetch(croppedImage)
                       const blob = await res.blob()
-                      const result = await extractMakeup(blob)
+                      // Prepare form data
+                      const formData = new FormData()
+                      formData.append('file', blob, 'face.jpg')
+                      formData.append('attributes', JSON.stringify(selectedAttributes))
+                      const result = await extractMakeup(formData)
                       setMakeupResult(result)
                     } catch (err: any) {
                       setMakeupError(err.message || 'Failed to extract makeup')
@@ -236,39 +322,38 @@ const ImageUpload: React.FC<ImageUploadProps> = () => {
                       setExtractingMakeup(false)
                     }
                   }}
-                  disabled={extractingMakeup}
+                  disabled={extractingMakeup || selectedAttributes.length === 0}
                 >
-                  {extractingMakeup ? 'Extracting Makeup...' : 'Extract Makeup Attributes'}
+                  {extractingMakeup ? 'Extracting...' : 'Extract Makeup Attributes'}
                 </button>
                 {makeupError && (
                   <div className="mt-2 text-red-600">{makeupError}</div>
                 )}
                 {makeupResult && (
                   <div className="mt-4 space-y-2">
-                    <div>
-                      <span className="font-semibold">Lips Color:</span>
-                      <span
-                        className="inline-block w-6 h-6 ml-2 rounded align-middle border"
-                        style={{ background: `rgb(${makeupResult.lips_color.join(',')})` }}
-                      ></span>
-                      <span className="ml-2 text-sm text-gray-700">[{makeupResult.lips_color.join(', ')}]</span>
-                    </div>
-                    <div>
-                      <span className="font-semibold">Left Eye Color:</span>
-                      <span
-                        className="inline-block w-6 h-6 ml-2 rounded align-middle border"
-                        style={{ background: `rgb(${makeupResult.left_eye_color.join(',')})` }}
-                      ></span>
-                      <span className="ml-2 text-sm text-gray-700">[{makeupResult.left_eye_color.join(', ')}]</span>
-                    </div>
-                    <div>
-                      <span className="font-semibold">Right Eye Color:</span>
-                      <span
-                        className="inline-block w-6 h-6 ml-2 rounded align-middle border"
-                        style={{ background: `rgb(${makeupResult.right_eye_color.join(',')})` }}
-                      ></span>
-                      <span className="ml-2 text-sm text-gray-700">[{makeupResult.right_eye_color.join(', ')}]</span>
-                    </div>
+                    {ATTRIBUTE_OPTIONS.filter(opt => selectedAttributes.includes(opt.key)).map(opt => {
+                      if (opt.key === 'contour_shape') {
+                        return (
+                          <div key={opt.key}>
+                            <span className="font-semibold">Contour (Jawline) Shape:</span>
+                            <span className="ml-2 text-sm text-gray-700">{makeupResult.contour_shape?.length || 0} points</span>
+                            <details className="ml-2">
+                              <summary className="cursor-pointer text-blue-600">Show coordinates</summary>
+                              <pre className="text-xs max-h-32 overflow-auto bg-gray-50 p-2 border rounded">{JSON.stringify(makeupResult.contour_shape)}</pre>
+                            </details>
+                          </div>
+                        )
+                      }
+                      const color = makeupResult[opt.key as keyof MakeupExtractionResult] as [number, number, number] | undefined
+                      if (!color) return null
+                      return (
+                        <div key={opt.key}>
+                          <span className="font-semibold">{opt.label} Color:</span>
+                          <span className="inline-block w-6 h-6 ml-2 rounded align-middle border" style={{ background: `rgb(${color.join(',')})` }}></span>
+                          <span className="ml-2 text-sm text-gray-700">[{color.join(', ')}]</span>
+                        </div>
+                      )
+                    })}
                   </div>
                 )}
               </div>
