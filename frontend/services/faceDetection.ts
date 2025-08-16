@@ -33,6 +33,7 @@ export interface MakeupExtractionResult {
   left_cheek_color: [number, number, number];
   right_cheek_color: [number, number, number];
   contour_shape: [number, number][]; // Array of [x, y] pixel coordinates
+  annotated_image?: string; // base64 PNG with overlays
 }
 
 export async function extractMakeup(formData: FormData): Promise<MakeupExtractionResult> {
@@ -44,6 +45,25 @@ export async function extractMakeup(formData: FormData): Promise<MakeupExtractio
   console.log('Makeup API response:', text);
   if (!res.ok) {
     throw new Error('Makeup extraction failed: ' + text);
+  }
+  return JSON.parse(text);
+}
+
+export interface UnetExtractionResult {
+  colorized_mask: string; // base64 PNG
+  region_colors: Record<string, [number, number, number]>;
+}
+
+export async function unetExtractMakeup(file: File | Blob): Promise<UnetExtractionResult> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const res = await fetch('/api/face/makeup/unet_extract', {
+    method: 'POST',
+    body: formData,
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error('U-Net extraction failed: ' + text);
   }
   return JSON.parse(text);
 } 

@@ -3,7 +3,7 @@
 import React, { useState, useCallback, useRef } from 'react'
 import { useDropzone } from 'react-dropzone'
 import { CloudArrowUpIcon } from '@heroicons/react/24/outline'
-import { detectFaces, FaceDetectionResult, extractMakeup, MakeupExtractionResult } from '../services/faceDetection'
+import { detectFaces, FaceDetectionResult, extractMakeup, MakeupExtractionResult, unetExtractMakeup, UnetExtractionResult } from '../services/faceDetection'
 
 interface ImageUploadProps {}
 
@@ -25,6 +25,9 @@ const ImageUpload: React.FC<ImageUploadProps> = () => {
   const [makeupResult, setMakeupResult] = useState<MakeupExtractionResult | null>(null)
   const [extractingMakeup, setExtractingMakeup] = useState(false)
   const [makeupError, setMakeupError] = useState<string | null>(null)
+  const [unetResult, setUnetResult] = useState<UnetExtractionResult | null>(null)
+  const [extractingUnet, setExtractingUnet] = useState(false)
+  const [unetError, setUnetError] = useState<string | null>(null)
 
   // Attribute options
   const ATTRIBUTE_OPTIONS = [
@@ -279,6 +282,49 @@ const ImageUpload: React.FC<ImageUploadProps> = () => {
             <div className="mt-4">
               <h4 className="font-semibold">Cropped Face</h4>
               <img src={croppedImage} alt="Cropped face" className="rounded shadow" />
+              {/* U-Net Extraction Button */}
+              <div className="mt-2">
+                <button
+                  className="px-4 py-2 bg-green-600 text-white rounded mr-4 disabled:opacity-50"
+                  onClick={async () => {
+                    setExtractingUnet(true)
+                    setUnetError(null)
+                    setUnetResult(null)
+                    try {
+                      const res = await fetch(croppedImage)
+                      const blob = await res.blob()
+                      const result = await unetExtractMakeup(blob)
+                      setUnetResult(result)
+                    } catch (err: any) {
+                      setUnetError(err.message || 'Failed to extract with U-Net')
+                    } finally {
+                      setExtractingUnet(false)
+                    }
+                  }}
+                  disabled={extractingUnet}
+                >
+                  {extractingUnet ? 'Extracting with U-Net...' : 'U-Net Segmentation Demo'}
+                </button>
+                {unetError && <div className="mt-2 text-red-600">{unetError}</div>}
+                {unetResult && (
+                  <div className="mt-4">
+                    <h4 className="font-semibold mb-2">U-Net Segmentation Mask</h4>
+                    <img src={unetResult.colorized_mask} alt="U-Net mask" className="rounded shadow max-w-full" />
+                    <div className="mt-2">
+                      <h5 className="font-semibold">Region Colors</h5>
+                      <ul className="text-sm">
+                        {Object.entries(unetResult.region_colors).map(([region, color]) => (
+                          <li key={region} className="flex items-center gap-2 mb-1">
+                            <span className="w-4 h-4 rounded border inline-block" style={{ background: `rgb(${color.join(',')})` }}></span>
+                            <span className="capitalize">{region}:</span>
+                            <span>[{color.join(', ')}]</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                )}
+              </div>
               <div className="mt-4">
                 <div className="mb-2 flex items-center gap-4 flex-wrap">
                   <label className="flex items-center gap-2 cursor-pointer">
@@ -354,6 +400,13 @@ const ImageUpload: React.FC<ImageUploadProps> = () => {
                         </div>
                       )
                     })}
+                    {/* Annotated image display */}
+                    {makeupResult.annotated_image && (
+                      <div className="mt-6">
+                        <h4 className="font-semibold mb-2">Detected Regions Overlay</h4>
+                        <img src={makeupResult.annotated_image} alt="Annotated face regions" className="rounded shadow max-w-full" />
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

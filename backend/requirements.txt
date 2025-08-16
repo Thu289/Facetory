@@ -20,3 +20,7 @@ torchvision
 retina-face
 tf-keras
 mediapipe
+tqdm
+matplotlib==3.7.4
+scipy==1.11.4
+scikit-learn==1.3.2

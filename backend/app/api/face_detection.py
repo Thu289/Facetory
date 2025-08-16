@@ -8,6 +8,11 @@ import base64
 # Add imports for MediaPipe and numpy
 import numpy as np
 import mediapipe as mp
+import cv2  # Add this import for drawing overlays
+from io import BytesIO
+from ai_models.unet.inference_unet import load_model, predict_mask, colorize_mask, PALETTE
+from ai_models.unet.inference_celeba_unet import process_image_with_celeba_unet
+import torch
 
 router = APIRouter()
 
@@ -84,10 +89,43 @@ async def crop_face(
         if os.path.exists(crop_path):
             os.remove(crop_path) 
 
+# Helper to draw overlays for each region
+
+def draw_regions_on_image(image: np.ndarray, regions: dict) -> np.ndarray:
+    overlay = image.copy()
+    color_map = {
+        "lips": (255, 0, 0),
+        "left_eye": (0, 255, 0),
+        "right_eye": (0, 255, 0),
+        "left_eyebrow": (0, 0, 255),
+        "right_eyebrow": (0, 0, 255),
+        "left_cheek": (255, 255, 0),
+        "right_cheek": (255, 255, 0),
+        "contour": (255, 0, 255),
+    }
+    alpha = 0.4  # Transparency
+    for region_name, points in regions.items():
+        if not points:
+            continue
+        pts = np.array(points, np.int32)
+        pts = pts.reshape((-1, 1, 2))
+        cv2.fillPoly(overlay, [pts], color_map.get(region_name, (255, 255, 255)))
+    # Blend overlay with original image
+    cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
+    return image
+
+def image_to_base64(image: np.ndarray) -> str:
+    pil_img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    buffered = BytesIO()
+    pil_img.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{img_str}"
+
 @router.post("/makeup/extract")
 async def extract_makeup(file: UploadFile = File(...)):
     """
     Extract makeup attributes (lips, eyes, eyebrows, blush, contour) from a cropped face image using MediaPipe Face Mesh
+    Returns both the attributes and an annotated image with overlays for each region.
     """
     # Validate file type
     if not file.content_type.startswith("image/"):
@@ -118,13 +156,11 @@ async def extract_makeup(file: UploadFile = File(...)):
             RIGHT_EYEBROW_IDX = list(range(276, 296))
             LEFT_CHEEK_IDX = list(range(205, 218))
             RIGHT_CHEEK_IDX = list(range(425, 438))
-            # Jawline/contour: left (0-16), right (267-284)
             JAWLINE_IDX = list(range(0, 17)) + list(range(267, 285))
             # Helper to get mask for a region
             def region_mask(indices):
                 mask = np.zeros((h, w), dtype=np.uint8)
                 region = np.array([points[i] for i in indices], dtype=np.int32)
-                cv2 = __import__('cv2')
                 cv2.fillPoly(mask, [region], 1)
                 return mask.astype(bool)
             # Helper to get average color
@@ -151,6 +187,20 @@ async def extract_makeup(file: UploadFile = File(...)):
             right_cheek_color = avg_color(right_cheek_mask)
             # Contour (jawline) shape: return as list of points
             contour_points = [points[i] for i in JAWLINE_IDX]
+            # Prepare regions for overlay
+            regions = {
+                "lips": [points[i] for i in LIPS_IDX],
+                "left_eye": [points[i] for i in LEFT_EYE_IDX],
+                "right_eye": [points[i] for i in RIGHT_EYE_IDX],
+                "left_eyebrow": [points[i] for i in LEFT_EYEBROW_IDX],
+                "right_eyebrow": [points[i] for i in RIGHT_EYEBROW_IDX],
+                "left_cheek": [points[i] for i in LEFT_CHEEK_IDX],
+                "right_cheek": [points[i] for i in RIGHT_CHEEK_IDX],
+                "contour": contour_points,
+            }
+            # Draw overlays
+            annotated_img = draw_regions_on_image(img_np.copy(), regions)
+            annotated_img_b64 = image_to_base64(annotated_img)
             return {
                 "lips_color": lips_color,
                 "left_eye_color": left_eye_color,
@@ -159,10 +209,85 @@ async def extract_makeup(file: UploadFile = File(...)):
                 "right_eyebrow_color": right_eyebrow_color,
                 "left_cheek_color": left_cheek_color,
                 "right_cheek_color": right_cheek_color,
-                "contour_shape": contour_points  # list of [x, y] pixel coordinates
+                "contour_shape": contour_points,
+                "annotated_image": annotated_img_b64
             }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Makeup extraction failed: {str(e)}")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path) 
+
+@router.post("/makeup/unet_extract")
+async def unet_extract_makeup(file: UploadFile = File(...)):
+    """
+    Extract face regions using U-Net, return colorized mask and average color for each region.
+    """
+    temp_filename = f"unet_{uuid.uuid4().hex[:8]}.jpg"
+    temp_path = os.path.join("/tmp", temp_filename)
+    with open(temp_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    try:
+        pil_img = Image.open(temp_path).convert('RGB')
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        model = load_model(device)
+        mask = predict_mask(model, pil_img, device)
+        color_mask_img = colorize_mask(mask)
+        # Encode color mask as base64
+        buffered = BytesIO()
+        color_mask_img.save(buffered, format="PNG")
+        mask_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        # Compute average color for each region
+        region_colors = {}
+        np_img = np.array(pil_img.resize(mask.shape[::-1]))
+        for idx, name in enumerate([
+            "background", "skin", "lips", "eyes", "eyebrows", "cheeks", "other"
+        ]):
+            region_pixels = np_img[mask == idx]
+            if len(region_pixels) == 0:
+                region_colors[name] = [0, 0, 0]
+            else:
+                region_colors[name] = [int(np.mean(region_pixels[:, i])) for i in range(3)]
+        return {
+            "colorized_mask": f"data:image/png;base64,{mask_b64}",
+            "region_colors": region_colors
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"U-Net extraction failed: {str(e)}")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path) 
+
+@router.post("/makeup/celeba_unet_extract")
+async def celeba_unet_extract_makeup(file: UploadFile = File(...)):
+    """
+    Extract makeup attributes using CelebAMask-HQ U-Net model
+    """
+    # Validate file type
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image.")
+    
+    # Save file temporarily
+    temp_filename = f"celeba_unet_{uuid.uuid4().hex[:8]}.jpg"
+    temp_path = os.path.join("/tmp", temp_filename)
+    
+    with open(temp_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    
+    try:
+        # Process with CelebAMask-HQ U-Net
+        result = process_image_with_celeba_unet(temp_path)
+        
+        return {
+            "colorized_mask": f"data:image/png;base64,{result['colorized_mask']}",
+            "annotated_image": f"data:image/png;base64,{result['annotated_image']}",
+            "region_colors": result["region_colors"],
+            "attributes": result["attributes"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CelebAMask-HQ U-Net extraction failed: {str(e)}")
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path) 
