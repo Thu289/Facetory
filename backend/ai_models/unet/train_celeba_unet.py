@@ -19,28 +19,19 @@ CELEBA_ATTRIBUTES = [
 ]
 
 class CelebAMaskHQDataset(Dataset):
-    def __init__(self, img_dir, mask_dir, transform=None, target_size=(512, 512)):
+    def __init__(self, img_dir, mask_dir, image_indices=None, transform=None, target_size=(512, 512)):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
         self.transform = transform
         self.target_size = target_size
+        self.image_indices = image_indices  # List of image IDs to use
         
-        # Get all image files
-        self.img_files = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
-        
-        # Create image ID to mask files mapping
-        self.img_to_masks = {}
-        for img_file in self.img_files:
-            img_id = os.path.splitext(os.path.basename(img_file))[0]
-            mask_files = self._get_mask_files_for_image(img_id)
-            if mask_files:  # Only include images that have masks
-                self.img_to_masks[img_id] = mask_files
-        
-        # Filter to only include images with masks
-        self.img_files = [f for f in self.img_files 
-                         if os.path.splitext(os.path.basename(f))[0] in self.img_to_masks]
-        
-        print(f"Found {len(self.img_files)} images with masks")
+        self.total_images = len(self.image_indices)
+        print(f"Dataset: {self.total_images} images (IDs: {min(self.image_indices)}-{max(self.image_indices)})")
+    
+    def _get_image_path(self, img_id):
+        """Get image path for given ID"""
+        return os.path.join(self.img_dir, f"{img_id}.jpg")
     
     def _get_mask_files_for_image(self, img_id):
         """Get all mask files for a given image ID"""
@@ -87,15 +78,26 @@ class CelebAMaskHQDataset(Dataset):
         return combined_mask
     
     def __len__(self):
-        return len(self.img_files)
+        return self.total_images
     
     def __getitem__(self, idx):
-        img_file = self.img_files[idx]
-        img_id = os.path.splitext(os.path.basename(img_file))[0]
-        mask_files = self.img_to_masks[img_id]
+        # Get actual image ID from the indices list
+        img_id = self.image_indices[idx]
+        
+        # Get image path
+        img_path = self._get_image_path(img_id)
+        
+        # Check if image exists
+        if not os.path.exists(img_path):
+            raise FileNotFoundError(f"Image {img_id}.jpg not found")
+        
+        # Get mask files for this image
+        mask_files = self._get_mask_files_for_image(img_id)
+        if not mask_files:
+            raise ValueError(f"No masks found for image {img_id}")
         
         # Load and preprocess image
-        image = Image.open(img_file).convert('RGB')
+        image = Image.open(img_path).convert('RGB')
         image = image.resize(self.target_size, Image.BILINEAR)
         
         # Create combined mask
@@ -178,14 +180,18 @@ class UNet(nn.Module):
         
         return self.final(dec1)
 
-def train_model(model, train_loader, val_loader, num_epochs=50, device='cuda'):
+def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda'):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5)
     
     train_losses = []
-    val_losses = []
-    best_val_loss = float('inf')
+    test_losses = []
+    best_test_loss = float('inf')
+    
+    # Model save path
+    model_save_path = 'checkpoints/best_unet.pth'
+    os.makedirs('checkpoints', exist_ok=True)
     
     for epoch in range(num_epochs):
         # Training
@@ -193,7 +199,7 @@ def train_model(model, train_loader, val_loader, num_epochs=50, device='cuda'):
         train_loss = 0
         train_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
         
-        for images, masks in train_bar:
+        for batch_idx, (images, masks) in enumerate(train_bar):
             images = images.to(device)
             masks = masks.to(device)
             
@@ -204,46 +210,54 @@ def train_model(model, train_loader, val_loader, num_epochs=50, device='cuda'):
             optimizer.step()
             
             train_loss += loss.item()
-            train_bar.set_postfix({'Loss': f'{loss.item():.4f}'})
+            train_bar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Batch': f'{batch_idx+1}/{len(train_loader)}',
+                'Avg': f'{train_loss/(batch_idx+1):.4f}'
+            })
         
         train_loss /= len(train_loader)
         train_losses.append(train_loss)
         
-        # Validation
+        # Testing
         model.eval()
-        val_loss = 0
-        val_bar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
+        test_loss = 0
+        test_bar = tqdm(test_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Test]')
         
         with torch.no_grad():
-            for images, masks in val_bar:
+            for batch_idx, (images, masks) in enumerate(test_bar):
                 images = images.to(device)
                 masks = masks.to(device)
                 
                 outputs = model(images)
                 loss = criterion(outputs, masks)
-                val_loss += loss.item()
-                val_bar.set_postfix({'Loss': f'{loss.item():.4f}'})
+                test_loss += loss.item()
+                test_bar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Batch': f'{batch_idx+1}/{len(test_loader)}',
+                    'Avg': f'{test_loss/(batch_idx+1):.4f}'
+                })
         
-        val_loss /= len(val_loader)
-        val_losses.append(val_loss)
+        test_loss /= len(test_loader)
+        test_losses.append(test_loss)
         
         # Learning rate scheduling
-        scheduler.step(val_loss)
+        scheduler.step(test_loss)
         
         print(f'Epoch {epoch+1}/{num_epochs}:')
         print(f'  Train Loss: {train_loss:.4f}')
-        print(f'  Val Loss: {val_loss:.4f}')
+        print(f'  Test Loss: {test_loss:.4f}')
         print(f'  LR: {optimizer.param_groups[0]["lr"]:.6f}')
         
         # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), 'best_celeba_unet.pth')
-            print(f'  Saved best model (Val Loss: {val_loss:.4f})')
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
+            torch.save(model.state_dict(), model_save_path)
+            print(f'  ✅ Saved best model (Test Loss: {test_loss:.4f}) to {model_save_path}')
         
         print('-' * 50)
     
-    return train_losses, val_losses
+    return train_losses, test_losses
 
 def visualize_predictions(model, val_loader, device, num_samples=5):
     """Visualize model predictions"""
@@ -285,6 +299,20 @@ def visualize_predictions(model, val_loader, device, num_samples=5):
     plt.savefig('celeba_predictions.png', dpi=150, bbox_inches='tight')
     plt.show()
 
+def create_train_test_split(total_images=30000, test_ratio=0.2, random_seed=42):
+    """Create train/test split indices without loading images"""
+    import random
+    random.seed(random_seed)
+    
+    all_indices = list(range(total_images))
+    random.shuffle(all_indices)
+    
+    test_size = int(total_images * test_ratio)
+    test_indices = all_indices[:test_size]
+    train_indices = all_indices[test_size:]
+    
+    return train_indices, test_indices
+
 def main():
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -307,28 +335,27 @@ def main():
     print(f"Image directory: {img_dir} (exists: {os.path.isdir(img_dir)})")
     print(f"Mask directory: {mask_dir} (exists: {os.path.isdir(mask_dir)})")
     
-    # Create dataset
+    # Create train/test split without loading all images
+    print("📊 Creating train/test split...")
+    train_indices, test_indices = create_train_test_split(total_images=30000, test_ratio=0.2, random_seed=42)
+    
+    print(f"✅ Split created: {len(train_indices)} train, {len(test_indices)} test")
+    
+    # Create datasets with indices only (no image loading yet)
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    dataset = CelebAMaskHQDataset(img_dir, mask_dir, transform=transform)
+    train_dataset = CelebAMaskHQDataset(img_dir, mask_dir, image_indices=train_indices, transform=transform)
+    test_dataset = CelebAMaskHQDataset(img_dir, mask_dir, image_indices=test_indices, transform=transform)
     
-    # Split dataset
-    train_indices, val_indices = train_test_split(
-        range(len(dataset)), test_size=0.2, random_state=42
-    )
+    # Create data loaders with batch size 50
+    train_loader = DataLoader(train_dataset, batch_size=50, shuffle=True, num_workers=2, persistent_workers=True)
+    test_loader = DataLoader(test_dataset, batch_size=50, shuffle=False, num_workers=2, persistent_workers=True)
     
-    train_dataset = torch.utils.data.Subset(dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(dataset, val_indices)
-    
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=4)
-    
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Val samples: {len(val_dataset)}")
+    print(f"🚀 Train samples: {len(train_dataset)}")
+    print(f"🧪 Test samples: {len(test_dataset)}")
     print(f"Number of classes: {len(CELEBA_ATTRIBUTES) + 1}")  # +1 for background
     
     # Create model
@@ -337,24 +364,58 @@ def main():
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Train model
-    train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs=50, device=device)
-    
-    # Plot training curves
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Val Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss')
-    plt.legend()
-    plt.savefig('celeba_training_curves.png', dpi=150, bbox_inches='tight')
-    plt.show()
+    # Check if model already exists
+    model_path = 'checkpoints/best_unet.pth'
+    if os.path.exists(model_path):
+        print(f"🔄 Loading existing model from {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print("✅ Model loaded successfully!")
+        
+        # Just run evaluation on test set
+        print("\n📊 Running evaluation on test set...")
+        model.eval()
+        test_loss = 0
+        test_bar = tqdm(test_loader, desc="Evaluation [Test]")
+        
+        with torch.no_grad():
+            for batch_idx, (images, masks) in enumerate(test_bar):
+                images = images.to(device)
+                masks = masks.to(device)
+                
+                outputs = model(images)
+                loss = nn.CrossEntropyLoss()(outputs, masks)
+                test_loss += loss.item()
+                test_bar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Batch': f'{batch_idx+1}/{len(test_loader)}'
+                })
+        
+        test_loss /= len(test_loader)
+        print(f"\n📈 Final Test Loss: {test_loss:.4f}")
+        
+    else:
+        print("🚀 Starting training...")
+        # Train model
+        train_losses, test_losses = train_model(model, train_loader, test_loader, num_epochs=50, device=device)
+        
+        # Plot training curves
+        plt.figure(figsize=(10, 5))
+        plt.plot(train_losses, label='Train Loss')
+        plt.plot(test_losses, label='Test Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training and Test Loss')
+        plt.legend()
+        plt.savefig('celeba_training_curves.png', dpi=150, bbox_inches='tight')
+        plt.show()
+        
+        print("✅ Training completed!")
     
     # Visualize predictions
-    visualize_predictions(model, val_loader, device)
+    visualize_predictions(model, test_loader, device)
     
-    print("Training completed!")
+    print(f"\n🎯 Model ready for inference!")
+    print(f"📁 Best model saved at: {model_path}")
 
 if __name__ == "__main__":
     main() 
