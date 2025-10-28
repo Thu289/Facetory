@@ -37,6 +37,7 @@ services:
       - redis
     networks:
       - facetory-network
+    shm_size: '8gb'
 
   # Database
   postgres:
