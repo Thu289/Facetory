@@ -10,6 +10,8 @@ import glob
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import gc
+import tempfile
+import pickle
 
 # Define the 19 CelebAMask-HQ attributes
 CELEBA_ATTRIBUTES = [
@@ -19,15 +21,24 @@ CELEBA_ATTRIBUTES = [
 ]
 
 class CelebAMaskHQDataset(Dataset):
-    def __init__(self, img_dir, mask_dir, image_indices=None, transform=None, target_size=(256, 256)):
+    def __init__(self, img_dir, mask_dir, image_indices=None, transform=None, target_size=(256, 256), cache_dir='cache'):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
         self.transform = transform
         self.target_size = target_size
         self.image_indices = image_indices
+        self.cache_dir = cache_dir
+        
+        # Create cache directory
+        os.makedirs(cache_dir, exist_ok=True)
         
         self.total_images = len(self.image_indices)
         print(f"Dataset: {self.total_images} images (IDs: {min(self.image_indices)}-{max(self.image_indices)})")
+        print(f"Cache directory: {cache_dir}")
+    
+    def _get_cache_path(self, img_id, data_type='image'):
+        """Get cache file path for image or mask"""
+        return os.path.join(self.cache_dir, f"{img_id}_{data_type}.npy")
     
     def _get_image_path(self, img_id):
         """Get image path for given ID"""
@@ -68,28 +79,68 @@ class CelebAMaskHQDataset(Dataset):
         
         return combined_mask
     
+    def _load_or_cache_image(self, img_id):
+        """Load image from cache or disk, cache if not exists"""
+        cache_path = self._get_cache_path(img_id, 'image')
+        
+        # Try to load from cache
+        if os.path.exists(cache_path):
+            image_array = np.load(cache_path)
+            return image_array
+        
+        # Load from original file
+        img_path = self._get_image_path(img_id)
+        if not os.path.exists(img_path):
+            raise FileNotFoundError(f"Image {img_id}.jpg not found")
+        
+        image = Image.open(img_path).convert('RGB')
+        image = image.resize(self.target_size, Image.BILINEAR)
+        image_array = np.array(image)
+        
+        # Save to cache
+        np.save(cache_path, image_array)
+        
+        return image_array
+    
+    def _load_or_cache_mask(self, img_id):
+        """Load mask from cache or disk, cache if not exists"""
+        cache_path = self._get_cache_path(img_id, 'mask')
+        
+        # Try to load from cache
+        if os.path.exists(cache_path):
+            mask = np.load(cache_path)
+            return mask
+        
+        # Load from original files
+        mask_files = self._get_mask_files_for_image(img_id)
+        if not mask_files:
+            raise ValueError(f"No masks found for image {img_id}")
+        
+        mask = self._create_combined_mask(mask_files)
+        
+        # Save to cache
+        np.save(cache_path, mask)
+        
+        return mask
+    
     def __len__(self):
         return self.total_images
     
     def __getitem__(self, idx):
         img_id = self.image_indices[idx]
-        img_path = self._get_image_path(img_id)
         
-        if not os.path.exists(img_path):
-            raise FileNotFoundError(f"Image {img_id}.jpg not found")
+        # Load from cache or disk
+        image_array = self._load_or_cache_image(img_id)
+        mask = self._load_or_cache_mask(img_id)
         
-        mask_files = self._get_mask_files_for_image(img_id)
-        if not mask_files:
-            raise ValueError(f"No masks found for image {img_id}")
+        # Convert to PIL for transforms
+        image = Image.fromarray(image_array)
         
-        image = Image.open(img_path).convert('RGB')
-        image = image.resize(self.target_size, Image.BILINEAR)
-        
-        mask = self._create_combined_mask(mask_files)
-        
+        # Apply transforms
         if self.transform:
             image = self.transform(image)
         
+        # Convert mask to tensor
         mask = torch.from_numpy(mask).long()
         
         return image, mask
@@ -162,7 +213,7 @@ class UNet(nn.Module):
         
         return self.final(dec1)
 
-def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda'):
+def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda', accumulation_steps=4):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5)
@@ -180,29 +231,47 @@ def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda'):
         train_loss = 0
         train_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
         
+        optimizer.zero_grad()
+        
         for batch_idx, (images, masks) in enumerate(train_bar):
-            images = images.to(device)
-            masks = masks.to(device)
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
             
-            optimizer.zero_grad()
+            # Forward pass
             outputs = model(images)
             loss = criterion(outputs, masks)
-            loss.backward()
-            optimizer.step()
+            loss = loss / accumulation_steps
             
-            train_loss += loss.item()
+            # Backward pass
+            loss.backward()
+            
+            # Update weights only after accumulation_steps
+            if (batch_idx + 1) % accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            train_loss += loss.item() * accumulation_steps
             train_bar.set_postfix({
-                'Loss': f'{loss.item():.4f}',
+                'Loss': f'{loss.item() * accumulation_steps:.4f}',
                 'Avg': f'{train_loss/(batch_idx+1):.4f}'
             })
             
-            # Clear cache periodically
-            if batch_idx % 50 == 0:
+            # Aggressive memory cleanup
+            del images, masks, outputs, loss
+            if batch_idx % 5 == 0:  # More frequent cleanup
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 gc.collect()
         
+        # Final optimizer step if there are remaining gradients
+        optimizer.step()
+        optimizer.zero_grad()
+        
         train_loss /= len(train_loader)
         train_losses.append(train_loss)
+        
+        # Clear memory before validation
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        gc.collect()
         
         # Testing
         model.eval()
@@ -211,8 +280,8 @@ def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda'):
         
         with torch.no_grad():
             for batch_idx, (images, masks) in enumerate(test_bar):
-                images = images.to(device)
-                masks = masks.to(device)
+                images = images.to(device, non_blocking=True)
+                masks = masks.to(device, non_blocking=True)
                 
                 outputs = model(images)
                 loss = criterion(outputs, masks)
@@ -221,6 +290,12 @@ def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda'):
                     'Loss': f'{loss.item():.4f}',
                     'Avg': f'{test_loss/(batch_idx+1):.4f}'
                 })
+                
+                # Clean up
+                del images, masks, outputs, loss
+                if batch_idx % 5 == 0:
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                    gc.collect()
         
         test_loss /= len(test_loader)
         test_losses.append(test_loss)
@@ -295,19 +370,56 @@ def visualize_predictions(model, val_loader, device, num_samples=3):
     plt.close()
     print("✅ Visualization saved to checkpoints/celeba_predictions.png")
 
-def create_train_test_split(total_images=30000, test_ratio=0.2, random_seed=42):
-    """Create train/test split indices without loading images"""
+def create_train_test_split(img_dir, test_ratio=0.2, random_seed=42):
+    """Create train/test split indices based on actual existing images"""
     import random
     random.seed(random_seed)
     
-    all_indices = list(range(total_images))
+    # Get list of actual existing image files
+    print("📁 Scanning for existing images...")
+    img_files = [f for f in os.listdir(img_dir) if f.endswith('.jpg')]
+    all_indices = [int(f.split('.')[0]) for f in img_files]
+    all_indices.sort()
+    
+    print(f"✅ Found {len(all_indices)} images")
+    print(f"   Range: {min(all_indices)} to {max(all_indices)}")
+    
+    # Shuffle indices
     random.shuffle(all_indices)
     
-    test_size = int(total_images * test_ratio)
+    # Split into train/test
+    test_size = int(len(all_indices) * test_ratio)
     test_indices = all_indices[:test_size]
     train_indices = all_indices[test_size:]
     
     return train_indices, test_indices
+
+def preprocess_and_cache_dataset(img_dir, mask_dir, indices, cache_dir, target_size=(256, 256)):
+    """Pre-process and cache all images to disk"""
+    print(f"\n🔄 Pre-processing and caching {len(indices)} images to {cache_dir}...")
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Use a temporary dataset just for caching
+    temp_transform = transforms.Compose([transforms.ToTensor()])
+    temp_dataset = CelebAMaskHQDataset(
+        img_dir, mask_dir, 
+        image_indices=indices, 
+        transform=temp_transform,
+        target_size=target_size,
+        cache_dir=cache_dir
+    )
+    
+    # Force load all items to cache
+    pbar = tqdm(range(len(temp_dataset)), desc="Caching data")
+    for idx in pbar:
+        try:
+            _ = temp_dataset[idx]
+            if idx % 100 == 0:
+                gc.collect()
+        except Exception as e:
+            print(f"\n⚠️  Error caching index {idx}: {e}")
+    
+    print("✅ Caching completed!")
 
 def main():
     # Set device
@@ -319,6 +431,7 @@ def main():
     # Data paths
     img_dir = "data/CelebAMask-HQ/CelebA-HQ-img"
     mask_dir = "data/CelebAMask-HQ/CelebAMask-HQ-mask-anno"
+    cache_dir = "cache"  # Cache directory
     
     print(f"Image directory: {img_dir} (exists: {os.path.isdir(img_dir)})")
     print(f"Mask directory: {mask_dir} (exists: {os.path.isdir(mask_dir)})")
@@ -326,14 +439,25 @@ def main():
     # Create train/test split
     print("📊 Creating train/test split...")
     train_indices, test_indices = create_train_test_split(
-        total_images=30000, 
+        img_dir=img_dir,
         test_ratio=0.2, 
         random_seed=42
     )
     
     print(f"✅ Split created: {len(train_indices)} train, {len(test_indices)} test")
     
-    # Create datasets (reduced image size to 256x256)
+    # Pre-cache all data (runs once, then uses disk cache)
+    target_size = (256, 256)
+    
+    # Check if cache exists, if not, create it
+    cache_exists = os.path.isdir(cache_dir) and len(os.listdir(cache_dir)) > 0
+    if not cache_exists:
+        print("\n💾 Cache not found. Pre-processing all data...")
+        preprocess_and_cache_dataset(img_dir, mask_dir, train_indices + test_indices, cache_dir, target_size)
+    else:
+        print(f"\n✅ Using existing cache: {cache_dir}")
+    
+    # Create datasets (will use cache)
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -343,39 +467,41 @@ def main():
         img_dir, mask_dir, 
         image_indices=train_indices, 
         transform=transform,
-        target_size=(256, 256)  # Reduced from 512
+        target_size=target_size,
+        cache_dir=cache_dir
     )
     test_dataset = CelebAMaskHQDataset(
         img_dir, mask_dir, 
         image_indices=test_indices, 
         transform=transform,
-        target_size=(256, 256)  # Reduced from 512
+        target_size=target_size,
+        cache_dir=cache_dir
     )
     
-    # Create data loaders with smaller batch size
-    BATCH_SIZE = 8  # Reduced from 50
-    NUM_WORKERS = 0 if not use_pin_memory else 2  # No workers on CPU
+    # Create data loaders with minimal RAM usage
+    BATCH_SIZE = 2  # Very small batch
+    NUM_WORKERS = 0  # No multiprocessing
+    ACCUMULATION_STEPS = 8  # Effective batch = 2 * 8 = 16
     
     train_loader = DataLoader(
         train_dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
         num_workers=NUM_WORKERS,
-        pin_memory=use_pin_memory,
-        persistent_workers=False  # Changed to False
+        pin_memory=use_pin_memory
     )
     test_loader = DataLoader(
         test_dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=False, 
         num_workers=NUM_WORKERS,
-        pin_memory=use_pin_memory,
-        persistent_workers=False  # Changed to False
+        pin_memory=use_pin_memory
     )
     
-    print(f"🚀 Train samples: {len(train_dataset)}")
+    print(f"\n🚀 Train samples: {len(train_dataset)}")
     print(f"🧪 Test samples: {len(test_dataset)}")
     print(f"📦 Batch size: {BATCH_SIZE}")
+    print(f"🔄 Accumulation steps: {ACCUMULATION_STEPS} (effective batch: {BATCH_SIZE * ACCUMULATION_STEPS})")
     print(f"👥 Workers: {NUM_WORKERS}")
     print(f"Number of classes: {len(CELEBA_ATTRIBUTES) + 1}")
     
@@ -389,7 +515,7 @@ def main():
     # Check if model already exists
     model_path = 'checkpoints/best_unet.pth'
     if os.path.exists(model_path):
-        print(f"🔄 Loading existing model from {model_path}")
+        print(f"\n🔄 Loading existing model from {model_path}")
         model.load_state_dict(torch.load(model_path, map_location=device))
         print("✅ Model loaded successfully!")
         
@@ -413,11 +539,12 @@ def main():
         print(f"\n📈 Final Test Loss: {test_loss:.4f}")
         
     else:
-        print("🚀 Starting training...")
+        print("\n🚀 Starting training...")
         train_losses, test_losses = train_model(
             model, train_loader, test_loader, 
             num_epochs=50, 
-            device=device
+            device=device,
+            accumulation_steps=ACCUMULATION_STEPS
         )
         
         # Plot training curves
