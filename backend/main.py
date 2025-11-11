@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import os
 
-from app.api import upload, auth, face_detection
+from app.api import upload, auth, face_detection, style_management, model_info, visualization
 from app.core.config import settings
 
 app = FastAPI(
@@ -25,6 +25,9 @@ app.add_middleware(
 app.include_router(upload.router, prefix="/api/upload", tags=["upload"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(face_detection.router, prefix="/api/face", tags=["face-detection"])
+app.include_router(style_management.router, prefix="/api/makeup", tags=["style-management"])
+app.include_router(model_info.router, prefix="/api", tags=["model-info"])
+app.include_router(visualization.router, prefix="/api/visualization", tags=["visualization"])
 
 # Mount static files
 if os.path.exists("uploads"):

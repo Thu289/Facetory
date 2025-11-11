@@ -31,6 +31,7 @@ services:
     volumes:
       - ./backend:/app
       - ./uploads:/app/uploads
+      - ./backend/weights/.deepface/weights:/root/.deepface/weights:ro
     depends_on:
       - postgres
       - minio
@@ -38,6 +39,10 @@ services:
     networks:
       - facetory-network
     shm_size: '8gb'
+    deploy:
+      resources:
+        limits:
+          memory: 16G
 
   # Database
   postgres:
