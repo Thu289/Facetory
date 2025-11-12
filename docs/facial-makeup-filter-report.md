@@ -62,10 +62,28 @@ The workflow begins when a creator uploads a style image through the web interfa
 
 ### 3.2 System Architecture
 
-The presentation, application, and data layers interact through well-defined interfaces. Figure 3.1 shows the static module architecture, capturing the main components and the direction of data flow. The presentation layer includes React components such as `StyleUpload`, `StyleSelector`, and `CameraFilter`. The application layer encompasses FastAPI endpoints for style creation (`/api/makeup/style/create_complete`), style listing, and filter application (`/api/makeup/style/apply`). The data layer covers MinIO storage for overlays, JSON metadata, and segmentation previews. This layered view helps distinguish responsibilities—for instance, mask generation lives entirely in the application layer, whereas mask visualisation is strictly a presentation concern.
+**Figure 3.1 – End-to-end filter workflow**
 
 ```mermaid
-%% Figure 3.1 – System architecture overview
+flowchart TD
+    A[Creator uploads style image] --> B[RetinaFace crop]
+    B --> C[BiSeNet segmentation]
+    C --> D[Region mask builder]
+    D --> E[RGBA overlay generation]
+    E --> F[Store overlays + metadata in MinIO]
+    F --> G[User selects style]
+    G --> H[FaceMesh landmarks on target face]
+    H --> I[Piecewise affine warp overlays]
+    I --> J[Blend (soft-light / linear)]
+    J --> K[Preview image & live camera output]
+```
+
+Figure 3.1 summarises the end-to-end workflow, from ingesting a style image to rendering the warped overlays on live or uploaded targets.
+
+The presentation, application, and data layers interact through well-defined interfaces. Figure 3.2 shows the static module architecture, capturing the main components and the direction of data flow. The presentation layer includes React components such as `StyleUpload`, `StyleSelector`, and `CameraFilter`. The application layer encompasses FastAPI endpoints for style creation (`/api/makeup/style/create_complete`), style listing, and filter application (`/api/makeup/style/apply`). The data layer covers MinIO storage for overlays, JSON metadata, and segmentation previews. This layered view helps distinguish responsibilities—for instance, mask generation lives entirely in the application layer, whereas mask visualisation is strictly a presentation concern.
+
+```mermaid
+%% Figure 3.2 – System architecture overview
 graph TD
     subgraph Presentation Layer
         A[StyleUpload UI] -->|Upload style image| B
@@ -91,10 +109,10 @@ graph TD
     H --> D
 ```
 
-Complementing the static architecture, Figure 3.2 provides a sequence diagram that highlights the dynamics of a filter-application request. It emphasises how overlays are fetched lazily, how masks are regenerated when necessary, and how the renderer caches assets to minimise latency. The Mermaid code below can be rendered with any Markdown engine that supports Mermaid, or exported to SVG/PDF using the Mermaid CLI.
+Complementing the static architecture, Figure 3.3 provides a sequence diagram that highlights the dynamics of a filter-application request. It emphasises how overlays are fetched lazily, how masks are regenerated when necessary, and how the renderer caches assets to minimise latency. The Mermaid code below can be rendered with any Markdown engine that supports Mermaid, or exported to SVG/PDF using the Mermaid CLI.
 
 ```mermaid
-%% Figure 3.2 – Sequence of applying a stored filter to an image
+%% Figure 3.3 – Sequence of applying a stored filter to an image
 sequenceDiagram
     participant UI as Web UI
     participant API as FastAPI Backend
@@ -117,9 +135,43 @@ sequenceDiagram
 
 Together, Figures 3.1 and 3.2 clarify both the static organisation and the runtime interaction patterns within the system. They also make explicit where each technology from Chapter 2.2 is employed in the overall pipeline.
 
-### 3.3 Summary
+### 3.3 Methodology: Preserving Detail While Thinning the Skin Base
 
-The design adheres to principles of modularity and reusability. By confining segmentation and mask generation to discrete services, the system can swap out models or preprocessing steps without altering the frontend. Storing overlays as RGBA PNGs makes them easy to cache and reuse, and additional regions can be incorporated by extending the mask-generation module. The architecture also gracefully handles failures: if BiSeNet or MediaPipe fails to detect a face during filter application, the renderer falls back to average-colour blending, ensuring that the user still sees a consistent experience. This chapter provides the blueprint that the subsequent implementation builds upon.
+To achieve a translucent yet detailed skin layer, the pipeline applies a colour-distance driven attenuation pass after the RGBA overlay has been generated. The process begins by extracting the dominant skin tone from the overlay pixels whose alpha exceeds a small threshold. A robust median estimate seeds a three-cluster k-means step executed in RGB space; the cluster closest to the median in Lab space is retained as the dominant colour. Every pixel then receives a Euclidean distance-to-dominant-colour score (`diff`), which serves as the basis for transparency decisions.
+
+Rather than relying on manually tuned percentiles, the system normalises `diff` by subtracting the minimum distance observed in the mask and dividing by the dynamic range. The resulting `[0,1]` score is optionally passed through a `diff_gamma` exponent to emphasise either subtle gradients (`gamma > 1`) or bold accents (`gamma < 1`). A configurable pair of parameters—`base_alpha_floor` and `base_alpha_scale`—ensures that even low-distance pixels retain a minimum share of their original opacity, while high-distance pixels can approach full opacity. When additional artistic control is needed, creators can supply a tiered mapping of thresholds to weights, allowing, for example, mid-tone freckles to remain partially visible while the base skin colour fades.
+
+To combat specular highlights that would otherwise punch through the mask, the system also computes a luminance percentile over the active pixels. Values exceeding the chosen highlight percentile are softened via a Gaussian-blurred highlight mask and a user-adjustable `highlight_scale`, subtly tamping down blown-out regions without erasing them entirely. The final detail map is multiplied with the original alpha channel and can optionally be run through a soft-light style remap, giving artists a smooth knob between purely linear attenuation and a more contrast-preserving curve.
+
+This methodology gives fine control over three competing goals: (1) removing broad swaths of the base skin tone, (2) preserving high-frequency makeup strokes such as contour lines or pores, and (3) keeping highlight behaviour stable across lighting conditions. It also keeps the behaviour consistent between backend renders and the live WebGL pipeline, as identical parameters are serialised with the style metadata and consumed by both runtimes.
+
+**Table 3.1 – Skin attenuation parameters (backend default values)**
+
+| Parameter               | Default | Purpose                                                                          |
+|-------------------------|---------|----------------------------------------------------------------------------------|
+| `diff_gamma`            | 1.35    | Raises normalised distance to emphasise detail contrast before weighting        |
+| `base_alpha_floor`      | 0.35    | Guarantees a minimum retained opacity for low-distance pixels                   |
+| `base_alpha_scale`      | 0.65    | Scales the contribution of the distance-driven weight map                       |
+| `blend_mode`            | `softlight` | Applies a contrast-preserving remap to the weight map when enabled        |
+| `softlight_strength`    | 0.4     | Controls the curvature of the soft-light remap                                  |
+| `highlight_percentile`  | 97.5    | Sets luminance cutoff for highlight suppression                                 |
+| `min_highlight_luminance` | 0.85 | Prevents over-attentuation by clamping the minimum highlight threshold          |
+| `highlight_scale`       | 0.35    | Minimum alpha multiplier applied to highlight regions after smoothing           |
+| `highlight_blur_sigma`  | 2.5     | Gaussian sigma used to feather highlight masks                                  |
+
+**Rationale and evolution.** Earlier iterations of the pipeline relied on fixed lower/upper percentiles to turn the distance map into an alpha weight. While straightforward, the percentile approach proved brittle: darker style images produced narrow spreads that erased facial detail, whereas brighter exemplars retained too much of the base tone, especially under uneven illumination. The revised method removes percentile thresholds entirely, replacing them with normalisation plus `diff_gamma`. This allows the response curve to be tuned continuously and symmetrically across diverse lighting conditions.
+
+- `diff_gamma` sharpens the response to colour deviations. Values above 1 amplify mid-range differences—revealing contour edges or blush strokes—without forcing them into a hard threshold. Conversely, `gamma=1` reverts to a linear mapping, and values below 1 intentionally soften transitions when a gentler look is desired.
+- `base_alpha_floor` captures the insight that completely removing the base layer often produces plastic-looking skin. Keeping at least 35 % of the original alpha maintains microtexture (pores, fine hairs) even if the colour closely matches the dominant tone.
+- `base_alpha_scale` controls how much of the colour-distance map is blended back in; together with the floor it ensures the total contribution never exceeds the original overlay. Artists can lower the scale to emphasise transparency or raise it towards 0.9 for bolder makeup.
+- `blend_mode="softlight"` and `softlight_strength` replicate the perceptual behaviour of soft-light compositing without moving the entire pipeline into the non-linear blend at this stage. A strength of 0.4 allows bright regions to remain gentle while still deepening shadow accents. Setting `blend_mode="linear"` disables the remap for debugging parity.
+- `highlight_percentile`, `min_highlight_luminance`, `highlight_scale`, and `highlight_blur_sigma` collectively tackle specular glare. Previous approaches either ignored highlights—causing blown-out patches to dominate—or clipped them aggressively, leading to artificial halos. The new combination trims only the upper luminance tail, feathers the mask to avoid hard edges, and scales residual alpha so that highlights persist at roughly one third intensity, mimicking translucent powder rather than opaque foundation.
+
+The parameters are designed to work in concert rather than isolation. A higher `diff_gamma` amplifies the response of `base_alpha_scale`, so artists typically pair `gamma=1.5`—for an expressive look—with a slightly lower scale (≈0.55) to avoid flattening the skin base. When the goal is a dewy finish, `base_alpha_floor` can be raised to 0.45 and `blend_mode` set to `linear`, letting more of the original sheen through while still attenuating mid-tone deviations. Conversely, a matte finish may lower the floor to 0.25, keep `softlight_strength` around 0.5, and reduce `highlight_scale` to 0.25 so strong hotspots remain subdued. Because the same parameter bundle is serialised with each style, creators can define presets—*natural*, *matte*, *glow*—simply by adjusting these correlated values.
+
+`luminance`, defined as `0.299·R + 0.587·G + 0.114·B`, models perceived brightness in the RGB overlay. The coefficients mirror human sensitivity, emphasising green, then red, and de-emphasising blue. In the attenuation pass, this per-pixel luminance identifies areas dominated by lighting rather than pigment. High luminance values signal specular highlights on forehead or cheekbones; the highlight mask derived from the luminance percentile therefore targets bright reflections while leaving genuine chromatic detail unchanged. Using luminance (instead of raw colour magnitude) avoids misclassifying vivid makeup strokes as highlights, ensuring that only light-driven glare is softened.
+
+This parameterisation emerged from repeated failures of the percentile-driven and single-threshold strategies: both ignored local contrast, struggled with different skin tones, and produced inconsistent live camera behaviour compared to offline previews. By exposing intuitive levers (floor, scale, gamma, highlight attenuation) the current design delivers predictable, explainable control for artists while remaining mathematically robust across varied datasets.
 
 # Chapter 4 – Implementation and Results
 

@@ -15,8 +15,7 @@ export type RegionName =
   | 'eyebrow_left'
   | 'eyebrow_right'
   | 'skin'
-  | 'cheeks'
-  | 'nose';
+  | 'cheeks';
 
 export interface RegionStyle {
   average_rgb?: [number, number, number];

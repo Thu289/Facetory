@@ -11,7 +11,6 @@ const REGION_LABELS: Record<RegionName, string> = {
   eyebrow_right: 'Right Eyebrow',
   skin: 'Skin',
   cheeks: 'Cheeks',
-  nose: 'Nose',
 };
 
 const REGION_ORDER: RegionName[] = [
@@ -21,7 +20,6 @@ const REGION_ORDER: RegionName[] = [
   'eyebrows',
   'eyebrow_left',
   'eyebrow_right',
-  'nose',
   'eyes',
   'skin',
   'cheeks',

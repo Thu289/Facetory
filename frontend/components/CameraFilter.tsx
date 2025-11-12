@@ -121,7 +121,7 @@ export default function CameraFilter({ style, onError }: CameraFilterProps) {
 
             const filteredMasks: Record<string, ImageData> = {};
 
-            ['skin', 'nose'].forEach((region) => {
+            ['skin'].forEach((region) => {
               const mask = generatedMasks[region];
               if (mask) {
                 filteredMasks[region] = mask;
@@ -166,7 +166,6 @@ export default function CameraFilter({ style, onError }: CameraFilterProps) {
             // Update detected regions with only the active filters
             const detectedActiveRegions = [
               'skin',
-              'nose',
               ...lipRegions,
               ...browRegions,
               'lips',

@@ -154,3 +154,157 @@ def generate_region_overlays(
 
     return overlays
 
+
+def attenuate_skin_overlay_alpha(
+    overlay: Image.Image,
+    detail_strength: Optional[List[Tuple[float, float]]] = None,
+    highlight_percentile: float = 97.5,
+    min_highlight_luminance: float = 0.85,
+    highlight_scale: float = 0.35,
+    highlight_blur_sigma: float = 2.5,
+    diff_gamma: float = 1.35,
+    base_alpha_floor: float = 0.35,
+    base_alpha_scale: float = 0.65,
+    blend_mode: str = "linear",
+    softlight_strength: float = 0.4,
+) -> Image.Image:
+    """Reduce alpha for skin pixels that match the dominant skin tone.
+
+    Args:
+        overlay: Skin RGBA overlay image.
+        detail_strength: Optional list of (normalized_threshold, alpha_weight) tuples in ascending order.
+        highlight_percentile: Percentile (0-100) of luminance used to detect highlights for attenuation.
+        min_highlight_luminance: Minimum luminance (0-1 range) to classify a pixel as highlight.
+        highlight_scale: Minimum multiplier (0-1) applied to alpha in highlight regions.
+        highlight_blur_sigma: Gaussian sigma (in pixels) applied to highlight mask for soft reduction.
+        diff_gamma: Gamma exponent (>0) applied to normalized color distance before weighting.
+        base_alpha_floor: Minimum fraction of original alpha to preserve across the region (0-1).
+        base_alpha_scale: Additional alpha scaling applied after floor (0-1).
+        blend_mode: Optional blend mode (`linear`, `softlight`) used when reconstructing detail map.
+        softlight_strength: Strength (0-1) used when `blend_mode="softlight"`.
+
+    Returns:
+        Processed overlay preserving only detail regions; original overlay if no change.
+    """
+
+    if overlay.mode != "RGBA":
+        overlay = overlay.convert("RGBA")
+
+    rgba = np.array(overlay, dtype=np.uint8)
+    alpha = rgba[..., 3].astype(np.float32) / 255.0
+    mask = alpha > 1e-3
+
+    if not np.any(mask):
+        return overlay
+
+    rgb = rgba[..., :3].astype(np.float32)
+    samples = rgb[mask]
+
+    if samples.size == 0:
+        return overlay
+
+    base_color = np.median(samples, axis=0)
+    dominant_color = base_color
+
+    try:
+        data = samples.astype(np.float32)
+        if data.shape[0] >= 3:
+            K = 3
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.1)
+            ret, labels, centers = cv2.kmeans(data, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+            if centers is not None and len(centers) > 0:
+                base_lab = cv2.cvtColor(base_color.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2Lab).reshape(3)
+                center_lab = cv2.cvtColor(centers.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2Lab).reshape(-1, 3)
+                distances = np.linalg.norm(center_lab - base_lab, axis=1)
+                dominant_idx = int(np.argmin(distances))
+                dominant_color = centers[dominant_idx]
+    except Exception:
+        dominant_color = base_color
+
+    diff = np.linalg.norm(rgb - dominant_color, axis=-1)
+
+    diff_values = diff[mask]
+    if diff_values.size == 0:
+        return overlay
+
+    diff_min = float(diff_values.min())
+    diff_max = float(diff_values.max())
+    diff_range = max(diff_max - diff_min, 1e-4)
+
+    normalized_diff = np.clip((diff - diff_min) / diff_range, 0.0, 1.0)
+
+    if diff_gamma <= 0.0:
+        diff_gamma = 1.0
+    if not np.isclose(diff_gamma, 1.0):
+        normalized_diff = np.power(normalized_diff, diff_gamma)
+
+    if detail_strength:
+        tiered_weights = sorted(detail_strength, key=lambda item: item[0])
+        weight_map = np.zeros_like(normalized_diff, dtype=np.float32)
+        prev_threshold = 0.0
+        for threshold, weight in tiered_weights:
+            threshold_clamped = float(np.clip(threshold, 0.0, 1.0))
+            threshold_clamped = max(threshold_clamped, prev_threshold)
+            mask_band = (normalized_diff >= prev_threshold) & (
+                normalized_diff < threshold_clamped
+            )
+            weight_map[mask_band] = float(weight)
+            prev_threshold = threshold_clamped
+
+        weight_map[normalized_diff >= prev_threshold] = float(tiered_weights[-1][1])
+    else:
+        weight_map = normalized_diff.astype(np.float32)
+
+    base_alpha_floor = float(np.clip(base_alpha_floor, 0.0, 1.0))
+    base_alpha_scale = float(np.clip(base_alpha_scale, 0.0, 1.0))
+    if base_alpha_floor + base_alpha_scale > 1.0:
+        base_alpha_scale = max(0.0, 1.0 - base_alpha_floor)
+
+    detail_weight = base_alpha_floor + base_alpha_scale * weight_map
+
+    if blend_mode == "softlight":
+        t = np.clip(float(softlight_strength), 0.0, 1.0)
+        detail_weight = np.clip(t * (1.0 - (1.0 - detail_weight) * (1.0 - detail_weight)) + (1.0 - t) * detail_weight, 0.0, 1.0)
+
+    detail_alpha = alpha * detail_weight
+
+    luminance = (
+        0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    ) / 255.0
+    luminance_values = luminance[mask]
+
+    if luminance_values.size > 0 and 0.0 <= highlight_percentile <= 100.0:
+        highlight_threshold = float(
+            np.percentile(luminance_values, np.clip(highlight_percentile, 0.0, 100.0))
+        )
+        highlight_threshold = max(highlight_threshold, min_highlight_luminance)
+        if highlight_scale < 0.0:
+            highlight_scale = 0.0
+        if highlight_scale > 1.0:
+            highlight_scale = 1.0
+
+        highlight_mask = (luminance >= highlight_threshold).astype(np.float32)
+        highlight_mask *= mask.astype(np.float32)
+
+        if np.any(highlight_mask > 1e-3):
+            if highlight_blur_sigma > 0.0:
+                radius = max(1, int(round(highlight_blur_sigma * 3)))
+                ksize = radius * 2 + 1
+                highlight_weight = cv2.GaussianBlur(
+                    highlight_mask,
+                    (ksize, ksize),
+                    highlight_blur_sigma,
+                )
+            else:
+                highlight_weight = highlight_mask
+
+            highlight_weight = np.clip(highlight_weight, 0.0, 1.0)
+            reduction = 1.0 - highlight_scale
+            detail_alpha *= 1.0 - reduction * highlight_weight
+
+    if not np.any(detail_alpha > 1e-3):
+        return overlay
+
+    rgba[..., 3] = np.clip(detail_alpha * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(rgba, mode="RGBA")
+

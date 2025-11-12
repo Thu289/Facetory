@@ -457,7 +457,7 @@ def apply_style_to_image(
 
                 if np.any(combined_mask > 0):
                     mask_3d = np.stack([combined_mask, combined_mask, combined_mask], axis=-1)
-                    if region in {"skin", "nose"}:
+                    if region == "nose":
                         base_norm = np.clip(result / 255.0, 0.0, 1.0)
                         overlay_norm = np.clip(aligned_rgb / 255.0, 0.0, 1.0)
                         softlight = np.where(

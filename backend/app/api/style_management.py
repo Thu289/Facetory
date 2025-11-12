@@ -177,8 +177,7 @@ async def create_complete_style(
             "eyes": style_data.get('eyes', {}),
             "eyebrows": style_data.get('eyebrows', {}),
             "skin": style_data.get('skin', {}),
-            "cheeks": style_data.get('cheeks', {}),
-            "nose": style_data.get('nose', {})
+            "cheeks": style_data.get('cheeks', {})
         }
         
         # Create annotated image for thumbnail
@@ -306,6 +305,11 @@ async def create_complete_style(
             return masks
 
         region_masks_preview = build_region_masks(segmentation_mask, attribute_mapping)
+        if 'skin' in region_masks_preview and 'nose' in region_masks_preview:
+            region_masks_preview['skin'] = np.clip(
+                region_masks_preview['skin'] + region_masks_preview['nose'], 0.0, 1.0
+            )
+            region_masks_preview.pop('nose', None)
 
         # Step 5: Generate RGBA overlays for regions
         print(f"🎨 Step 5: Generating RGBA overlays for {style_id}...")
@@ -313,6 +317,7 @@ async def create_complete_style(
             generate_region_overlays,
             compute_average_color,
             resize_mask_to_image,
+            attenuate_skin_overlay_alpha,
         )
 
         region_meshes = compute_region_meshes(image_rgb)
@@ -322,6 +327,9 @@ async def create_complete_style(
             region_masks=region_masks_preview,
             fill_with_original=True
         )
+
+        if 'skin' in region_overlays:
+            region_overlays['skin'] = attenuate_skin_overlay_alpha(region_overlays['skin'])
 
         for region_name, overlay_image in region_overlays.items():
             filename = f"{style_id}_{region_name}_mask.png"
@@ -386,6 +394,11 @@ async def create_complete_style(
                         preview_seg_mask,
                         preview_bisenet.get('attribute_mapping', {})
                     )
+                    if 'skin' in preview_region_masks and 'nose' in preview_region_masks:
+                        preview_region_masks['skin'] = np.clip(
+                            preview_region_masks['skin'] + preview_region_masks['nose'], 0.0, 1.0
+                        )
+                        preview_region_masks.pop('nose', None)
             except Exception as preview_error:
                 print(f"Warning: Failed to generate user preview: {preview_error}")
                 preview_image_rgb = None
@@ -416,6 +429,11 @@ async def create_complete_style(
                         preview_seg_mask,
                         preview_bisenet.get('attribute_mapping', {})
                     )
+                    if 'skin' in preview_region_masks and 'nose' in preview_region_masks:
+                        preview_region_masks['skin'] = np.clip(
+                            preview_region_masks['skin'] + preview_region_masks['nose'], 0.0, 1.0
+                        )
+                        preview_region_masks.pop('nose', None)
             except Exception as preview_error:
                 print(f"Warning: Failed to generate default preview: {preview_error}")
 
@@ -1228,8 +1246,10 @@ async def apply_filter_to_image(
                 
                 # Eyes mask - ONLY l_eye and r_eye (NOT eye_g or brows)
                 # Note: 'eye_g' might include eyebrows, so exclude it
+                brow_class_ids = [class_id for class_id, attr in attribute_mapping.items()
+                                   if attr in ['l_brow', 'r_brow']]
                 eyes_class_ids = [class_id for class_id, attr in attribute_mapping.items() 
-                                 if attr in ['l_eye', 'r_eye']]  # Removed 'eye_g' to avoid including eyebrows
+                                  if attr in ['l_eye', 'r_eye']]  # Removed 'eye_g' to avoid including eyebrows
                 if eyes_class_ids:
                     # Create at original mask size
                     eyes_mask_full = np.zeros((mask_h, mask_w), dtype=np.float32)
@@ -1419,9 +1439,17 @@ async def apply_filter_to_image(
                         
                         # Store at original size
                         region_masks_original_size['nose'] = nose_mask_full.copy()
-                        # Resize to image size
                         nose_mask_resized = cv2.resize(nose_mask_full, (w, h), interpolation=cv2.INTER_NEAREST).astype(np.float32)
-                        region_masks['nose'] = nose_mask_resized
+                        existing_skin = region_masks.get('skin')
+                        if existing_skin is None:
+                            region_masks['skin'] = nose_mask_resized
+                        else:
+                            region_masks['skin'] = np.clip(existing_skin + nose_mask_resized, 0.0, 1.0)
+                        existing_skin_orig = region_masks_original_size.get('skin')
+                        if existing_skin_orig is None:
+                            region_masks_original_size['skin'] = nose_mask_full.copy()
+                        else:
+                            region_masks_original_size['skin'] = np.clip(existing_skin_orig + nose_mask_full, 0.0, 1.0)
                         
                         pixels_after_resize = np.sum(nose_mask_resized > 0)
                         print(f"✅ Nose mask SAU resize: {nose_mask_resized.shape}, pixels: {pixels_after_resize}")

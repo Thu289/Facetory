@@ -8,7 +8,6 @@ type RegionKey =
   | 'eyebrows'
   | 'eyebrow_left'
   | 'eyebrow_right'
-  | 'nose'
   | 'skin';
 
 type OverlayColor = [number, number, number];
@@ -39,10 +38,7 @@ const MESH_REGION_FALLBACKS: Partial<Record<RegionKey, RegionKey>> = {
   eyebrow_right: 'eyebrows',
 };
 
-const SOFTLIGHT_REGIONS: Set<RegionKey> = new Set([
-  'skin',
-  'nose'
-]);
+const SOFTLIGHT_REGIONS: Set<RegionKey> = new Set();
 
 interface RenderState {
   canvas: HTMLCanvasElement;
@@ -215,7 +211,7 @@ class RegionRenderer {
         ? (['eyebrow_left', 'eyebrow_right'] as RegionKey[])
         : (['eyebrows'] as RegionKey[]);
 
-    const regions: RegionKey[] = ['skin', ...lipsRegions, ...browRegions, 'nose'];
+    const regions: RegionKey[] = ['skin', ...lipsRegions, ...browRegions];
     regions.forEach((region) => applyRegion(region));
 
     ctx.putImageData(frame, 0, 0);
@@ -306,7 +302,6 @@ class RegionRenderer {
       'eyebrows',
       'eyebrow_left',
       'eyebrow_right',
-      'nose',
       'skin',
     ];
     await Promise.all(
