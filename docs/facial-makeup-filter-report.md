@@ -1,3 +1,16 @@
+# Abstract
+
+This report documents the design and implementation of a real-time facial makeup system that transforms reference styles into reusable assets and applies them consistently across static images and live video. The pipeline combines semantic segmentation for region isolation, landmark-guided mesh warping for geometric alignment, and adaptive alpha attenuation to preserve high-frequency details while suppressing skin-tone shifts. The resulting workflow enables creators to author filters from exemplar portraits, preview the outcome immediately, and deploy the same effect to camera feeds with minimal latency.
+
+# Report Layout
+
+- Chapter 1 outlines the problem context, reviews related work, and summarises the project contributions.
+- Chapter 2 introduces the theoretical foundations and technology stack that underpin the solution.
+- Chapter 3 details the system design, including modular architecture, data flow, and the attenuation methodology.
+- Chapter 4 explains the implementation of the creation and application stages and evaluates performance.
+- Chapter 5 discusses limitations, future enhancements, and concluding remarks.
+- Appendices provide supplementary code samples, figures, and dataset notes.
+
 # Chapter 1 – Introduction
 
 The convergence of augmented reality and computer vision has created a fertile ground for digital cosmetics, yet achieving photorealistic makeup overlays remains a challenging problem. Traditional approaches based on global colour transforms or handcrafted shaders frequently yield unnatural tones, ignore the anatomical nuances of each facial region, and fail to generalise across varied illumination or skin tones. The project documented in this report addresses these shortcomings by devising an end-to-end pipeline that extracts fine-grained RGBA masks from exemplar images, stores the resulting assets, and applies them to live camera feeds or static photographs with a physically inspired blending model. The following sections situate the problem, review related work, and highlight the main contributions.
@@ -12,7 +25,7 @@ The technical underpinnings of modern makeup filters lie at the intersection of 
 
 ### 1.3 Contribution
 
-The main contributions of this work can be summarised as follows. First, it implements a hybrid mask pipeline that transitions from LUT-only filters to RGBA overlays, including a split of key regions (upper and lower lips, left and right eyebrows, nose, and skin) and their respective coverage intensities. Second, it introduces a dual-stage workflow consisting of a filter-creation stage—responsible for segmentation, mask generation, and storage—and a filter-application stage that supports both static imagery and live camera feeds. Third, the system employs mesh-warped overlays driven by MediaPipe FaceMesh landmarks, combined with soft-light blending for selected regions to preserve texture while mitigating colour shifts. Fourth, a user-centric web interface was developed, allowing creators to upload style images, inspect mask previews, and test filters interactively; comprehensive logging assists with debugging segmentation issues. Fifth, the report documents a reference implementation that integrates FastAPI, OpenCV, BiSeNet, React/Next.js, and WebGL, offering a cohesive case study that can guide future AR beauty applications.
+The main contributions of this work can be summarised as follows. First, it implements a hybrid mask pipeline that transitions from LUT-only filters to RGBA overlays, including a split of key regions (upper and lower lips, left and right eyebrows, and a unified skin region that subsumes the nose) together with their coverage intensities. Second, it introduces a dual-stage workflow consisting of a filter-creation stage—responsible for segmentation, mask generation, and storage—and a filter-application stage that supports both static imagery and live camera feeds. Third, the system employs mesh-warped overlays driven by MediaPipe FaceMesh landmarks, coupled with adaptive alpha attenuation for the skin region to preserve texture while mitigating colour shifts. Fourth, a user-centric web interface was developed, allowing creators to upload style images, inspect mask previews, and test filters interactively; comprehensive logging assists with debugging segmentation issues. Fifth, the report documents a reference implementation that integrates FastAPI, OpenCV, BiSeNet, React/Next.js, and WebGL, offering a cohesive case study that can guide future AR beauty applications.
 
 # Chapter 2 – Theoretical Fundamentals
 
@@ -20,7 +33,7 @@ The success of the system hinges on a blend of theoretical disciplines: semantic
 
 ### 2.1 Overview
 
-Semantic segmentation partitions an image into classes on a per-pixel basis. BiSeNet delivers this functionality through a two-path architecture, combining spatial detail with semantic context to achieve real-time performance. The segmentation output is a class map that tags each pixel as belonging to one of nineteen categories (skin, hair, upper lip, lower lip, left eyebrow, right eyebrow, nose, and so on). Complementing segmentation, landmark detection provides a sparse but reliable correspondence between facial features across different images. MediaPipe FaceMesh approximates a three-dimensional surface using 468 landmarks and runs efficiently on commodity hardware; the detected points anchor the mesh-warping stage. Finally, pixel-wise blending merges the overlay with the base image. Linear alpha blending treats the overlay colour as an additive contribution, while soft-light blending modulates luminance non-linearly to preserve detail—particularly useful when the overlay emphasises subtle gradients such as skin texture. Together, these components form the theoretical foundation for region-aware makeup rendering.
+Semantic segmentation partitions an image into classes on a per-pixel basis. BiSeNet delivers this functionality through a two-path architecture, combining spatial detail with semantic context to achieve real-time performance. The segmentation output is a class map that tags each pixel as belonging to one of nineteen categories (skin, hair, upper lip, lower lip, left eyebrow, right eyebrow, nose, and so on). Complementing segmentation, landmark detection provides a sparse but reliable correspondence between facial features across different images. MediaPipe FaceMesh approximates a three-dimensional surface using 468 landmarks and runs efficiently on commodity hardware; the detected points anchor the mesh-warping stage. Finally, pixel-wise blending merges the overlay with the base image. Linear alpha blending treats the overlay colour as an additive contribution, while the skin-specific mask attenuation modulates alpha to preserve detail—particularly useful when the overlay emphasises subtle gradients such as contouring or powder. Together, these components form the theoretical foundation for region-aware makeup rendering.
 
 ### 2.2 Technology Stack
 
@@ -33,7 +46,7 @@ flowchart LR
     A[Input Style Image] --> B[Face Detection<br/>(RetinaFace)]
     B --> C[BiSeNet Segmentation<br/>(19 classes)]
     C --> D[Attribute Mapping]
-    D --> E[Region Mask Builder<br/>(split lips, brows, nose)]
+    D --> E[Region Mask Builder<br/>(split lips, brows, skin)]
     E --> F[RGBA Mask Generator<br/>(overlay PNGs)]
     F --> G[MinIO Storage<br/>+ Metadata]
 ```
@@ -45,7 +58,7 @@ flowchart LR
 | BiSeNet (PyTorch)          | Semantic segmentation of facial regions                      | Produces precise masks (19 classes) used to generate RGBA overlays and debug previews            |
 | MediaPipe FaceMesh         | Landmark detection and mesh construction                     | Supplies geometry for warping overlays to match target faces during preview and live rendering   |
 | OpenCV, NumPy, SciPy       | Warping, sampling, and numerical operations                  | Implements triangle-wise affine transforms and bilinear interpolation for smooth overlay mapping |
-| Soft-Light/Alpha Blending  | Colour-preserving compositing layer                          | Maintains skin tones via soft-light while keeping lips vivid with linear blending                |
+| Adaptive alpha attenuation | Colour-preserving compositing layer                          | Maintains skin tones via diff-weighted transparency while keeping lips vivid with linear blending |
 | FastAPI + Python services  | Backend orchestration                                        | Handles uploads, segmentation, mask generation, metadata storage, and diagnostic logging         |
 | MinIO                      | Object storage for RGBA masks, meshes, and metadata          | Provides durable storage with signed URL access for frontend fetches                            |
 | Next.js + TypeScript       | Frontend interface for creators, testers, and live camera UI | Offers upload forms, mask inspection tools, and WebGL-based real-time rendering                  |
@@ -55,6 +68,46 @@ flowchart LR
 # Chapter 3 – System Design
 
 System design bridges theoretical concepts and the implementation details that make the pipeline practical. The solution is intentionally split into two stages—a filter-creation stage that handles offline processing of style images, and a filter-application stage that renders the stored overlays onto new images or live camera feeds. Each stage is further organised into presentation, application, and data layers to promote separation of concerns.
+
+**Figure 3.0 – End-to-end processing pipeline**
+
+```
+┌─────────────────────────┐
+│ 1. Style/Target Image   │
+└─────────────┬───────────┘
+              │
+              ▼
+      Face Detection
+      (RetinaFace)
+              │ crop & bbox
+              ▼
+      Semantic Segmentation
+      (BiSeNet, 19 classes)
+              │ masks + attributes
+              ▼
+      Region Mask Builder
+      (split lips, brows, skin)
+              │ RGBA overlays
+              ▼
+      Skin Alpha Attenuation
+      (diff + highlight logic)
+              │ store assets
+              ▼
+      Style Storage (MinIO)
+              │ style metadata
+              ▼
+      Target Landmarks
+      (MediaPipe FaceMesh)
+              │ meshes
+              ▼
+      Mesh Warping & Blending
+      (piecewise affine + alpha)
+              │ composited frame
+              ▼
+┌─────────────┴───────────┐
+│  Output Image / Live UI │
+└─────────────────────────┘
+```
 
 ### 3.1 System Overview
 
@@ -74,7 +127,7 @@ flowchart TD
     F --> G[User selects style]
     G --> H[FaceMesh landmarks on target face]
     H --> I[Piecewise affine warp overlays]
-    I --> J[Blend (soft-light / linear)]
+    I --> J[Alpha attenuation & compositing]
     J --> K[Preview image & live camera output]
 ```
 
@@ -82,8 +135,9 @@ Figure 3.1 summarises the end-to-end workflow, from ingesting a style image to r
 
 The presentation, application, and data layers interact through well-defined interfaces. Figure 3.2 shows the static module architecture, capturing the main components and the direction of data flow. The presentation layer includes React components such as `StyleUpload`, `StyleSelector`, and `CameraFilter`. The application layer encompasses FastAPI endpoints for style creation (`/api/makeup/style/create_complete`), style listing, and filter application (`/api/makeup/style/apply`). The data layer covers MinIO storage for overlays, JSON metadata, and segmentation previews. This layered view helps distinguish responsibilities—for instance, mask generation lives entirely in the application layer, whereas mask visualisation is strictly a presentation concern.
 
+**Figure 3.2 – System architecture overview**
+
 ```mermaid
-%% Figure 3.2 – System architecture overview
 graph TD
     subgraph Presentation Layer
         A[StyleUpload UI] -->|Upload style image| B
@@ -111,8 +165,9 @@ graph TD
 
 Complementing the static architecture, Figure 3.3 provides a sequence diagram that highlights the dynamics of a filter-application request. It emphasises how overlays are fetched lazily, how masks are regenerated when necessary, and how the renderer caches assets to minimise latency. The Mermaid code below can be rendered with any Markdown engine that supports Mermaid, or exported to SVG/PDF using the Mermaid CLI.
 
+**Figure 3.3 – Sequence of applying a stored filter to an image**
+
 ```mermaid
-%% Figure 3.3 – Sequence of applying a stored filter to an image
 sequenceDiagram
     participant UI as Web UI
     participant API as FastAPI Backend
@@ -126,7 +181,7 @@ sequenceDiagram
     SEG-->>API: Return segmentation mask + attribute map
     API->>API: Build region masks (split lips/brows)
     API->>STORE: Fetch RGBA overlays (download URLs)
-    API->>API: Warp overlays using FaceMesh and soft-light blending
+    API->>API: Warp overlays using FaceMesh and alpha attenuation
     API-->>UI: Styled image (base64) + diagnostics
     UI->>REND: Update preview canvas
     REND->>STORE: Lazy fetch overlays for live use
@@ -141,7 +196,7 @@ To achieve a translucent yet detailed skin layer, the pipeline applies a colour-
 
 Rather than relying on manually tuned percentiles, the system normalises `diff` by subtracting the minimum distance observed in the mask and dividing by the dynamic range. The resulting `[0,1]` score is optionally passed through a `diff_gamma` exponent to emphasise either subtle gradients (`gamma > 1`) or bold accents (`gamma < 1`). A configurable pair of parameters—`base_alpha_floor` and `base_alpha_scale`—ensures that even low-distance pixels retain a minimum share of their original opacity, while high-distance pixels can approach full opacity. When additional artistic control is needed, creators can supply a tiered mapping of thresholds to weights, allowing, for example, mid-tone freckles to remain partially visible while the base skin colour fades.
 
-To combat specular highlights that would otherwise punch through the mask, the system also computes a luminance percentile over the active pixels. Values exceeding the chosen highlight percentile are softened via a Gaussian-blurred highlight mask and a user-adjustable `highlight_scale`, subtly tamping down blown-out regions without erasing them entirely. The final detail map is multiplied with the original alpha channel and can optionally be run through a soft-light style remap, giving artists a smooth knob between purely linear attenuation and a more contrast-preserving curve.
+To combat specular highlights that would otherwise punch through the mask, the system also computes a luminance percentile over the active pixels. Values exceeding the chosen highlight percentile are softened via a Gaussian-blurred highlight mask and a user-adjustable `highlight_scale`, subtly tamping down blown-out regions without erasing them entirely. The final detail map is multiplied with the original alpha channel, yielding an attenuated skin overlay that preserves microtexture while removing large regions that match the dominant tone.
 
 This methodology gives fine control over three competing goals: (1) removing broad swaths of the base skin tone, (2) preserving high-frequency makeup strokes such as contour lines or pores, and (3) keeping highlight behaviour stable across lighting conditions. It also keeps the behaviour consistent between backend renders and the live WebGL pipeline, as identical parameters are serialised with the style metadata and consumed by both runtimes.
 
@@ -152,8 +207,6 @@ This methodology gives fine control over three competing goals: (1) removing bro
 | `diff_gamma`            | 1.35    | Raises normalised distance to emphasise detail contrast before weighting        |
 | `base_alpha_floor`      | 0.35    | Guarantees a minimum retained opacity for low-distance pixels                   |
 | `base_alpha_scale`      | 0.65    | Scales the contribution of the distance-driven weight map                       |
-| `blend_mode`            | `softlight` | Applies a contrast-preserving remap to the weight map when enabled        |
-| `softlight_strength`    | 0.4     | Controls the curvature of the soft-light remap                                  |
 | `highlight_percentile`  | 97.5    | Sets luminance cutoff for highlight suppression                                 |
 | `min_highlight_luminance` | 0.85 | Prevents over-attentuation by clamping the minimum highlight threshold          |
 | `highlight_scale`       | 0.35    | Minimum alpha multiplier applied to highlight regions after smoothing           |
@@ -205,9 +258,15 @@ Quantitative evaluation relied on the FFHQ dataset. Table 4.1 summarises the seg
 
 Qualitatively, the introduction of soft-light blending for skin and nose significantly reduced colour discrepancies compared to the earlier LUT-based approach. Overlays aligned more closely with facial features thanks to mesh warping, especially in live camera scenarios where head movements are common. Nonetheless, hair segmentation remained unreliable; as a mitigation, the current configuration either omits the hair region or applies it with reduced intensity depending on the user’s preference. Users expressed satisfaction with the ability to inspect individual region masks in the interface, which provided transparency and allowed for quick remediation when segmentation misclassifications occurred. A limited user study with internal testers confirmed that the new pipeline delivered more natural makeup effects and a smoother authoring experience.
 
-**Figure 4.1 – Mask overlay comparison before/after soft-light blending**
+**Figure 4.1 – Mask overlay comparison for the reference style**
 
-> *Illustrative figure: side-by-side images showing (a) base face without filter, (b) overlay applied with linear blending (LUT baseline), and (c) overlay applied with mesh-warped soft-light blending. Place the generated image in `docs/images/figure4-1-mask-comparison.png` when available.*
+```mermaid
+flowchart LR
+    A[Base face] --> B[Linear blend<br/>(legacy LUT)]
+    A --> C[Mesh-warped overlay<br/>(alpha attenuated)]
+    B --> D[Visual comparison: desaturated, flat skin]
+    C --> E[Visual comparison: preserved pores, natural tone]
+```
 
 # Chapter 5 – Conclusion and Future Work
 
