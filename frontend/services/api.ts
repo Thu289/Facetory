@@ -39,6 +39,7 @@ export interface StyleData {
   style_id: string;
   name?: string;
   description?: string;
+  created_at?: string;
   download_urls: {
     region_masks?: Record<string, string>;
     style_parameters: string;

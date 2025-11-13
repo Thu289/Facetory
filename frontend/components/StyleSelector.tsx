@@ -13,7 +13,6 @@ export default function StyleSelector({ onStyleSelect, selectedStyleId }: StyleS
   const [styles, setStyles] = useState<StyleData[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [creatingDefault, setCreatingDefault] = useState(false);
 
   useEffect(() => {
     void loadStyles();
@@ -23,28 +22,17 @@ export default function StyleSelector({ onStyleSelect, selectedStyleId }: StyleS
     try {
       setLoading(true);
       const result = await apiService.listStyles();
-      setStyles(result.styles);
+      const sortedStyles = [...result.styles].sort((a, b) => {
+        const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
+        const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
+        return bTime - aTime;
+      });
+      setStyles(sortedStyles);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load styles');
       console.error('Failed to load styles:', err);
     } finally {
       setLoading(false);
-    }
-  };
-
-  const createDefaultStyle = async () => {
-    try {
-      setCreatingDefault(true);
-      const defaultStyle = await apiService.createDefaultStyle();
-      await loadStyles();
-      onStyleSelect(defaultStyle);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to create default style';
-      setError(message);
-      console.error('Failed to create default style:', err);
-      alert(`Failed to create default style: ${message}`);
-    } finally {
-      setCreatingDefault(false);
     }
   };
 
@@ -68,13 +56,6 @@ export default function StyleSelector({ onStyleSelect, selectedStyleId }: StyleS
     <div className="rounded-lg bg-white p-6 shadow">
       <div className="mb-4 flex items-center justify-between">
         <h2 className="text-xl font-semibold">Select Makeup Style</h2>
-        <button
-          onClick={createDefaultStyle}
-          disabled={creatingDefault}
-          className="rounded bg-red-600 px-4 py-2 text-sm text-white transition-colors hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {creatingDefault ? 'Creating...' : 'Create Default Red Lips Filter'}
-        </button>
       </div>
 
       {styles.length === 0 ? (
