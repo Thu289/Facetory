@@ -28,6 +28,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - JWT_SECRET=your-super-secret-jwt-key-change-in-production
       - CORS_ORIGINS=["http://localhost:3000"]
+      - SELENIUM_URL=http://selenium:4444/wd/hub 
     volumes:
       - ./backend:/app
       - ./uploads:/app/uploads
@@ -36,6 +37,7 @@ services:
       - postgres
       - minio
       - redis
+      - selenium
     networks:
       - facetory-network
     shm_size: '8gb'
@@ -83,6 +85,23 @@ services:
       - redis_data:/data
     networks:
       - facetory-network
+  # Selenium Grid (Standalone Chrome)
+  selenium:
+    image: selenium/standalone-chrome:latest
+    ports:
+      - "4444:4444"  # Selenium server
+      - "7900:7900"  # VNC viewer (để debug)
+    environment:
+      - SE_NODE_MAX_SESSIONS=5
+      - SE_NODE_SESSION_TIMEOUT=300
+      - SE_VNC_NO_PASSWORD=1
+    shm_size: '2gb'  # Quan trọng cho Chrome
+    networks:
+      - facetory-network
+    deploy:
+      resources:
+        limits:
+          memory: 4G
 
 volumes:
   postgres_data:
