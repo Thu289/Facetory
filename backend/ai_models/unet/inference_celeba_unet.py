@@ -8,7 +8,7 @@ import base64
 import io
 
 # Import the UNet model and attributes from training script
-from train_celeba_unet import UNet, CELEBA_ATTRIBUTES
+from ai_models.unet.train_celeba_unet import UNet, CELEBA_ATTRIBUTES
 
 # Color palette for visualization (20 colors for 19 attributes + background)
 PALETTE = [

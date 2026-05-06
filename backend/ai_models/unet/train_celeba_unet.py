@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import gc
 import tempfile
 import pickle
+import argparse
 
 # Define the 19 CelebAMask-HQ attributes
 CELEBA_ATTRIBUTES = [
@@ -28,13 +29,15 @@ class CelebAMaskHQDataset(Dataset):
         self.target_size = target_size
         self.image_indices = image_indices
         self.cache_dir = cache_dir
-        
-        # Create cache directory
-        os.makedirs(cache_dir, exist_ok=True)
-        
+        self.use_cache = cache_dir not in [None, False]
+        if self.use_cache:
+            os.makedirs(cache_dir, exist_ok=True)
         self.total_images = len(self.image_indices)
         print(f"Dataset: {self.total_images} images (IDs: {min(self.image_indices)}-{max(self.image_indices)})")
-        print(f"Cache directory: {cache_dir}")
+        if self.use_cache:
+            print(f"Cache directory: {cache_dir}")
+        else:
+            print("Running without cache: images/masks will be loaded directly each time.")
     
     def _get_cache_path(self, img_id, data_type='image'):
         """Get cache file path for image or mask"""
@@ -80,47 +83,46 @@ class CelebAMaskHQDataset(Dataset):
         return combined_mask
     
     def _load_or_cache_image(self, img_id):
-        """Load image from cache or disk, cache if not exists"""
+        # If cache disabled, always load from file
+        if not self.use_cache:
+            img_path = self._get_image_path(img_id)
+            if not os.path.exists(img_path):
+                raise FileNotFoundError(f"Image {img_id}.jpg not found")
+            image = Image.open(img_path).convert('RGB')
+            image = image.resize(self.target_size, Image.BILINEAR)
+            return np.array(image)
+        # Otherwise, use regular cache logic
         cache_path = self._get_cache_path(img_id, 'image')
-        
-        # Try to load from cache
         if os.path.exists(cache_path):
             image_array = np.load(cache_path)
             return image_array
-        
-        # Load from original file
         img_path = self._get_image_path(img_id)
         if not os.path.exists(img_path):
             raise FileNotFoundError(f"Image {img_id}.jpg not found")
-        
         image = Image.open(img_path).convert('RGB')
         image = image.resize(self.target_size, Image.BILINEAR)
         image_array = np.array(image)
-        
-        # Save to cache
         np.save(cache_path, image_array)
-        
         return image_array
     
     def _load_or_cache_mask(self, img_id):
-        """Load mask from cache or disk, cache if not exists"""
+        # If cache disabled, always load from original png
+        if not self.use_cache:
+            mask_files = self._get_mask_files_for_image(img_id)
+            if not mask_files:
+                raise ValueError(f"No masks found for image {img_id}")
+            mask = self._create_combined_mask(mask_files)
+            return mask
+        # Otherwise, use regular cache logic
         cache_path = self._get_cache_path(img_id, 'mask')
-        
-        # Try to load from cache
         if os.path.exists(cache_path):
             mask = np.load(cache_path)
             return mask
-        
-        # Load from original files
         mask_files = self._get_mask_files_for_image(img_id)
         if not mask_files:
             raise ValueError(f"No masks found for image {img_id}")
-        
         mask = self._create_combined_mask(mask_files)
-        
-        # Save to cache
         np.save(cache_path, mask)
-        
         return mask
     
     def __len__(self):
@@ -213,16 +215,24 @@ class UNet(nn.Module):
         
         return self.final(dec1)
 
-def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda', accumulation_steps=4):
+def _compute_pixel_accuracy(outputs, masks):
+    with torch.no_grad():
+        predictions = torch.argmax(outputs, dim=1)
+        correct_pixels = (predictions == masks).sum().item()
+        total_pixels = masks.numel()
+    return correct_pixels, total_pixels
+
+def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda', accumulation_steps=4, model_save_path='checkpoints/best_unet.pth'):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5)
     
     train_losses = []
     test_losses = []
+    train_accuracies = []
+    test_accuracies = []
     best_test_loss = float('inf')
     
-    model_save_path = 'checkpoints/best_unet.pth'
     os.makedirs('checkpoints', exist_ok=True)
     
     for epoch in range(num_epochs):
@@ -230,6 +240,8 @@ def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda', 
         model.train()
         train_loss = 0
         train_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
+        train_correct = 0
+        train_total = 0
         
         optimizer.zero_grad()
         
@@ -251,9 +263,13 @@ def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda', 
                 optimizer.zero_grad()
             
             train_loss += loss.item() * accumulation_steps
+            correct_pixels, total_pixels = _compute_pixel_accuracy(outputs, masks)
+            train_correct += correct_pixels
+            train_total += total_pixels
             train_bar.set_postfix({
                 'Loss': f'{loss.item() * accumulation_steps:.4f}',
-                'Avg': f'{train_loss/(batch_idx+1):.4f}'
+                'AvgLoss': f'{train_loss/(batch_idx+1):.4f}',
+                'Acc': f'{(train_correct/max(1,train_total)):.4f}'
             })
             
             # Aggressive memory cleanup
@@ -268,6 +284,8 @@ def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda', 
         
         train_loss /= len(train_loader)
         train_losses.append(train_loss)
+        train_acc_epoch = train_correct / max(1, train_total)
+        train_accuracies.append(train_acc_epoch)
         
         # Clear memory before validation
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -277,6 +295,8 @@ def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda', 
         model.eval()
         test_loss = 0
         test_bar = tqdm(test_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Test]')
+        test_correct = 0
+        test_total = 0
         
         with torch.no_grad():
             for batch_idx, (images, masks) in enumerate(test_bar):
@@ -286,9 +306,12 @@ def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda', 
                 outputs = model(images)
                 loss = criterion(outputs, masks)
                 test_loss += loss.item()
+                correct_pixels, total_pixels = _compute_pixel_accuracy(outputs, masks)
+                test_correct += correct_pixels
+                test_total += total_pixels
                 test_bar.set_postfix({
                     'Loss': f'{loss.item():.4f}',
-                    'Avg': f'{test_loss/(batch_idx+1):.4f}'
+                    'AvgLoss': f'{test_loss/(batch_idx+1):.4f}'
                 })
                 
                 # Clean up
@@ -299,13 +322,15 @@ def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda', 
         
         test_loss /= len(test_loader)
         test_losses.append(test_loss)
+        test_acc_epoch = test_correct / max(1, test_total)
+        test_accuracies.append(test_acc_epoch)
         
         # Learning rate scheduling
         scheduler.step(test_loss)
         
         print(f'Epoch {epoch+1}/{num_epochs}:')
-        print(f'  Train Loss: {train_loss:.4f}')
-        print(f'  Test Loss: {test_loss:.4f}')
+        print(f'  Train Loss: {train_loss:.4f} | Train Acc: {train_acc_epoch:.4f}')
+        print(f'  Test  Loss: {test_loss:.4f} | Test  Acc: {test_acc_epoch:.4f}')
         print(f'  LR: {optimizer.param_groups[0]["lr"]:.6f}')
         
         # Save best model
@@ -332,7 +357,7 @@ def train_model(model, train_loader, test_loader, num_epochs=50, device='cuda', 
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         gc.collect()
     
-    return train_losses, test_losses
+    return train_losses, test_losses, train_accuracies, test_accuracies
 
 def visualize_predictions(model, val_loader, device, num_samples=3):
     """Visualize model predictions"""
@@ -394,6 +419,105 @@ def create_train_test_split(img_dir, test_ratio=0.2, random_seed=42):
     
     return train_indices, test_indices
 
+def list_indices_in_range(img_dir, start_id, end_id):
+    img_files = [f for f in os.listdir(img_dir) if f.endswith('.jpg')]
+    all_indices = [int(f.split('.')[0]) for f in img_files]
+    selected = [i for i in all_indices if start_id <= i <= end_id]
+    selected.sort()
+    return selected
+
+def train_on_subset(img_dir, mask_dir, cache_dir, start_id, end_id, train_count=4000, test_count=1000, target_size=(512, 512), num_epochs=20, device=None, persistent_model_path='checkpoints/best_model.pth', disable_cache=False, batch_size=2):
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_pin_memory = torch.cuda.is_available()
+
+    indices = list_indices_in_range(img_dir, start_id, end_id)
+    print(f"📚 Found {len(indices)} images in range [{start_id}, {end_id}]")
+    if len(indices) < (train_count + test_count):
+        print(f"⚠️  Not enough images in range. Requested {train_count + test_count}, got {len(indices)}")
+
+    train_indices = indices[:train_count]
+    test_indices = indices[train_count:train_count + test_count]
+    print(f"✅ Using {len(train_indices)} train and {len(test_indices)} test indices")
+
+    # Check cache logic: if disable_cache=True, don't pre-cache at all
+    if (not disable_cache) and (cache_dir not in [None, False]):
+        os.makedirs(cache_dir, exist_ok=True)
+        subset_indices = train_indices + test_indices
+        to_cache = []
+        for img_id in subset_indices:
+            img_cache = os.path.join(cache_dir, f"{img_id}_image.npy")
+            mask_cache = os.path.join(cache_dir, f"{img_id}_mask.npy")
+            if not (os.path.exists(img_cache) and os.path.exists(mask_cache)):
+                to_cache.append(img_id)
+        if to_cache:
+            print(f"\n💾 Detected {len(to_cache)} uncached items in subset. Pre-caching now...")
+            preprocess_and_cache_dataset(img_dir, mask_dir, to_cache, cache_dir, target_size)
+        else:
+            print("\n✅ All items in subset already cached. Skipping pre-cache.")
+    else:
+        print("\n🔄 Cache disabled: will load images/masks on the fly.")
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    user_cache_dir = cache_dir if (not disable_cache) else None
+    train_dataset = CelebAMaskHQDataset(img_dir, mask_dir, image_indices=train_indices, transform=transform, target_size=target_size, cache_dir=user_cache_dir)
+    test_dataset = CelebAMaskHQDataset(img_dir, mask_dir, image_indices=test_indices, transform=transform, target_size=target_size, cache_dir=user_cache_dir)
+
+    BATCH_SIZE = batch_size
+    NUM_WORKERS = 0
+    ACCUMULATION_STEPS = 1
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=use_pin_memory)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=use_pin_memory)
+
+    print(f"\n🚀 Subset Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
+
+    model = UNet(in_channels=3, out_channels=len(CELEBA_ATTRIBUTES) + 1).to(device)
+    # Load persistent model if exists to continue training across subsets
+    os.makedirs('checkpoints', exist_ok=True)
+    if os.path.exists(persistent_model_path):
+        print(f"\n🔄 Loading persistent model from {persistent_model_path} for continued training")
+        model.load_state_dict(torch.load(persistent_model_path, map_location=device))
+        print("✅ Persistent model loaded")
+
+    model_tag = f"{start_id}_{end_id}"
+    model_save_path = persistent_model_path
+
+    train_losses, test_losses, train_accs, test_accs = train_model(
+        model, train_loader, test_loader,
+        num_epochs=num_epochs,
+        device=device,
+        accumulation_steps=ACCUMULATION_STEPS,
+        model_save_path=model_save_path
+    )
+
+    # Save curves
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(test_losses, label='Test Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title(f'Loss Curves ({model_tag})')
+    plt.legend()
+    plt.savefig(f'checkpoints/training_curves_loss_{model_tag}.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_accs, label='Train Acc')
+    plt.plot(test_accs, label='Test Acc')
+    plt.xlabel('Epoch')
+    plt.ylabel('Pixel Accuracy')
+    plt.title(f'Accuracy Curves ({model_tag})')
+    plt.legend()
+    plt.savefig(f'checkpoints/training_curves_acc_{model_tag}.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"✅ Saved best model to {model_save_path}")
+    return model
+
 def preprocess_and_cache_dataset(img_dir, mask_dir, indices, cache_dir, target_size=(256, 256)):
     """Pre-process and cache all images to disk"""
     print(f"\n🔄 Pre-processing and caching {len(indices)} images to {cache_dir}...")
@@ -422,6 +546,16 @@ def preprocess_and_cache_dataset(img_dir, mask_dir, indices, cache_dir, target_s
     print("✅ Caching completed!")
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--start_id', type=int, default=None)
+    parser.add_argument('--end_id', type=int, default=None)
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--no_cache', action='store_true', help='If set, completely disable npy caching for dataset.')
+    parser.add_argument('--train_count', type=int, default=4000, help='Number of training images per subset.')
+    parser.add_argument('--test_count', type=int, default=1000, help='Number of test images per subset.')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size for loading data.')
+    parser.add_argument('--img_size', type=int, default=128, help='Size for resizing images/images (img_size x img_size).')
+    args = parser.parse_args()
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_pin_memory = torch.cuda.is_available()
@@ -429,14 +563,43 @@ def main():
     print(f"CUDA available: {torch.cuda.is_available()}")
     
     # Data paths
-    img_dir = "data/CelebAMask-HQ/CelebA-HQ-img"
-    mask_dir = "data/CelebAMask-HQ/CelebAMask-HQ-mask-anno"
+    img_dir = "CelebAMask-HQ/CelebA-HQ-img"
+    mask_dir = "CelebAMask-HQ/CelebAMask-HQ-mask-anno"
     cache_dir = "cache"  # Cache directory
     
     print(f"Image directory: {img_dir} (exists: {os.path.isdir(img_dir)})")
     print(f"Mask directory: {mask_dir} (exists: {os.path.isdir(mask_dir)})")
     
-    # Create train/test split
+    # Range-based subset mode
+    if args.start_id is not None and args.end_id is not None:
+        epochs = args.epochs if args.epochs is not None else 20
+        print("\n==== Subset Training Configuration ====")
+        print(f"Range:        [{args.start_id}, {args.end_id}]")
+        print(f"Train count:  {args.train_count}")
+        print(f"Test count:   {args.test_count}")
+        print(f"Batch size:   {args.batch_size}")
+        print(f"Image size:   {args.img_size}x{args.img_size}")
+        print(f"Epochs:       {epochs}")
+        print(f"Cache:        {'Disabled' if args.no_cache else 'Enabled'}")
+        print("=======================================\n")
+        _ = train_on_subset(
+            img_dir=img_dir,
+            mask_dir=mask_dir,
+            cache_dir=cache_dir,
+            start_id=args.start_id,
+            end_id=args.end_id,
+            train_count=args.train_count,
+            test_count=args.test_count,
+            target_size=(args.img_size, args.img_size),
+            num_epochs=epochs,
+            device=device,
+            persistent_model_path='checkpoints/best_model.pth',
+            disable_cache=args.no_cache,
+            batch_size=args.batch_size
+        )
+        return
+
+    # Default full-dataset split mode
     print("📊 Creating train/test split...")
     train_indices, test_indices = create_train_test_split(
         img_dir=img_dir,
@@ -447,7 +610,7 @@ def main():
     print(f"✅ Split created: {len(train_indices)} train, {len(test_indices)} test")
     
     # Pre-cache all data (runs once, then uses disk cache)
-    target_size = (256, 256)
+    target_size = (512, 512)  # Changed from 256 to 512
     
     # Check if cache exists, if not, create it
     cache_exists = os.path.isdir(cache_dir) and len(os.listdir(cache_dir)) > 0
@@ -463,25 +626,26 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
+    user_cache_dir = cache_dir if (not args.no_cache) else None
     train_dataset = CelebAMaskHQDataset(
         img_dir, mask_dir, 
         image_indices=train_indices, 
         transform=transform,
         target_size=target_size,
-        cache_dir=cache_dir
+        cache_dir=user_cache_dir
     )
     test_dataset = CelebAMaskHQDataset(
         img_dir, mask_dir, 
         image_indices=test_indices, 
         transform=transform,
         target_size=target_size,
-        cache_dir=cache_dir
+        cache_dir=user_cache_dir
     )
     
-    # Create data loaders with minimal RAM usage
-    BATCH_SIZE = 2  # Very small batch
+    # Create data loaders - optimized for 16GB RAM
+    BATCH_SIZE = 4  # Optimal for 512x512 images with 16GB RAM
     NUM_WORKERS = 0  # No multiprocessing
-    ACCUMULATION_STEPS = 8  # Effective batch = 2 * 8 = 16
+    ACCUMULATION_STEPS = 4  # Effective batch = 4 * 4 = 16
     
     train_loader = DataLoader(
         train_dataset, 
@@ -540,9 +704,9 @@ def main():
         
     else:
         print("\n🚀 Starting training...")
-        train_losses, test_losses = train_model(
+        train_losses, test_losses, train_accs, test_accs = train_model(
             model, train_loader, test_loader, 
-            num_epochs=50, 
+            num_epochs=10, 
             device=device,
             accumulation_steps=ACCUMULATION_STEPS
         )

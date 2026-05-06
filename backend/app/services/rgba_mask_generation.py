@@ -208,16 +208,26 @@ def attenuate_skin_overlay_alpha(
 
     try:
         data = samples.astype(np.float32)
-        if data.shape[0] >= 3:
-            K = 3
+        if data.shape[0] >= 5:
+            # Tăng k lên 5 để phát hiện nhiều vùng da mặt hơn
+            K = 5
             criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.1)
             ret, labels, centers = cv2.kmeans(data, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
             if centers is not None and len(centers) > 0:
-                base_lab = cv2.cvtColor(base_color.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2Lab).reshape(3)
-                center_lab = cv2.cvtColor(centers.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2Lab).reshape(-1, 3)
-                distances = np.linalg.norm(center_lab - base_lab, axis=1)
-                dominant_idx = int(np.argmin(distances))
-                dominant_color = centers[dominant_idx]
+                # Chọn cluster có nhiều điểm nhất (largest cluster) thay vì cluster gần median nhất
+                # Điều này giúp phát hiện được vùng da mặt chính (base skin) tốt hơn
+                unique_labels, counts = np.unique(labels, return_counts=True)
+                largest_cluster_idx = int(unique_labels[np.argmax(counts)])
+                dominant_color = centers[largest_cluster_idx]
+        elif data.shape[0] >= 3:
+            # Fallback cho trường hợp ít điểm hơn
+            K = min(3, data.shape[0])
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.1)
+            ret, labels, centers = cv2.kmeans(data, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+            if centers is not None and len(centers) > 0:
+                unique_labels, counts = np.unique(labels, return_counts=True)
+                largest_cluster_idx = int(unique_labels[np.argmax(counts)])
+                dominant_color = centers[largest_cluster_idx]
     except Exception:
         dominant_color = base_color
 
